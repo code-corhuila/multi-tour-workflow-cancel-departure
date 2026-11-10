@@ -1,0 +1,7 @@
+# Secrets never enter this repository (security rules, Annexes G and I). Only .env.example is versioned.
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+keys/
