@@ -44,3 +44,5 @@ jobs:
       # Builds the saga schema from an empty PostgreSQL, reruns, rolls back and rebuilds (Annex A, db-ci)
       - name: db-ci
         run: sh db/tests/db-ci.sh
+      - name: image
+        run: docker build -t multi-tour-workflow-cancel-departure:ci .
