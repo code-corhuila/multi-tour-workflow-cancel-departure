@@ -127,9 +127,11 @@ refused() { # fragment, statement
   printf '%s' "$out" | grep -q "$1" || { echo "refused, but not for the expected reason ($1): $out"; return 1; }
 }
 clean() { psql_admin -c "TRUNCATE ${T}_reservation, ${T}_step, $T" >/dev/null || { echo "could not clean the tables"; return 1; }; }
-saga() { # id, idempotency key, status, failed step (quoted or NULL), reason (quoted or NULL), tenant, departure code
-  printf "INSERT INTO %s (saga_id, idempotency_key, saga_status, failed_step, failure_reason, tenant_id, departure_code) VALUES ('%s', '%s', '%s', %s, %s, '%s', '%s')" \
-    "$T" "$1" "$2" "${3:-RUNNING}" "${4:-NULL}" "${5:-NULL}" "${6:-$TENANT}" "${7:-SAL-001}"
+saga() { # id, idempotency key, status, failed step (quoted or NULL), reason (quoted or NULL), tenant, departure code, "d" for one that passed step 1
+  cols=""; vals=""
+  if [ "${8:-}" = d ]; then cols=", departure_id, cancelled_at"; vals=", '$DEPARTURE', now()"; fi
+  printf "INSERT INTO %s (saga_id, idempotency_key, saga_status, failed_step, failure_reason, tenant_id, departure_code%s) VALUES ('%s', '%s', '%s', %s, %s, '%s', '%s'%s)" \
+    "$T" "$cols" "$1" "$2" "${3:-RUNNING}" "${4:-NULL}" "${5:-NULL}" "${6:-$TENANT}" "${7:-SAL-001}" "$vals"
 }
 step() { # saga id, number, name
   printf "INSERT INTO %s_step (saga_id, step_number, step_name) VALUES ('%s', %s, '%s')" "$T" "$1" "$2" "$3"
@@ -147,12 +149,24 @@ idempotency_key_is_unique_per_tenant_and_sized() {
 status_is_one_of_the_four_states_and_compensated_only_when_the_cancellation_was_refused() {
   clean
   U=00000000-0000-4000-8000-0000000000
-  psql_admin -c "$(saga ${U}b1 key-state-running RUNNING)" -c "$(saga ${U}b2 key-state-completed COMPLETED)" \
+  psql_admin -c "$(saga ${U}b1 key-state-running RUNNING)" -c "$(saga ${U}b2 key-state-completed COMPLETED NULL NULL $TENANT SAL-001 d)" \
              -c "$(saga ${U}b3 key-state-compensated COMPENSATED "'CANCEL_DEPARTURE'" "'DEPARTURE_REFUSED'")" \
-             -c "$(saga ${U}b4 key-state-failed FAILED "'OPEN_EPISODES'" "'RESERVATIONS_FAILED'")" >/dev/null || return 1
+             -c "$(saga ${U}b4 key-state-failed FAILED "'OPEN_EPISODES'" "'RESERVATIONS_FAILED'" $TENANT SAL-001 d)" >/dev/null || return 1
   refused chk_cancel_departure_saga_status "$(saga $S1 $KEY1 DONE)" || return 1
   # nothing is undone in this saga: COMPENSATED means only that the cancellation was refused and nothing changed
-  refused chk_cancel_departure_saga_compensated "$(saga $S1 $KEY1 COMPENSATED "'OPEN_EPISODES'" "'RESERVATIONS_FAILED'")"
+  refused chk_cancel_departure_saga_compensated "$(saga $S1 $KEY1 COMPENSATED "'OPEN_EPISODES'" "'RESERVATIONS_FAILED'")" || return 1
+  refused chk_cancel_departure_saga_compensated "$(saga $S1 $KEY1 COMPENSATED "'CANCEL_DEPARTURE'" "'RESERVATIONS_FAILED'")" || return 1
+  refused chk_cancel_departure_saga_compensated "$(saga $S1 $KEY1 COMPENSATED "'VOID_PROPOSALS'" "'DEPARTURE_REFUSED'")" || return 1
+  # a saga that ended COMPLETED passed step 1, so it has the id and the instant; one refused at step 1 has neither
+  refused chk_cancel_departure_saga_completed "$(saga $S1 $KEY1 COMPLETED)" || return 1
+  refused chk_cancel_departure_saga_refused_without_departure "$(saga $S1 $KEY1 COMPENSATED "'CANCEL_DEPARTURE'" "'DEPARTURE_REFUSED'" $TENANT SAL-001 d)"
+}
+defaults_start_a_saga_running_at_version_zero_and_a_reservation_pending() {
+  clean
+  psql_admin -c "INSERT INTO $T (saga_id, idempotency_key, tenant_id, departure_code) VALUES ('$S1', '$KEY1', '$TENANT', 'SAL-001')" \
+             -c "INSERT INTO ${T}_reservation (saga_id, reservation_id) VALUES ('$S1', '$RESERVATION')" >/dev/null || return 1
+  [ "$(psql_admin -c "SELECT saga_status || ':' || version FROM $T WHERE saga_id = '$S1'")" = "RUNNING:0" ] || { echo "a saga must start RUNNING at version 0"; return 1; }
+  [ "$(psql_admin -c "SELECT reservation_state FROM ${T}_reservation WHERE saga_id = '$S1'")" = "PENDING" ] || { echo "a reservation must start PENDING"; return 1; }
 }
 failed_step_goes_with_a_failed_status_a_known_name_and_a_known_reason() {
   clean
@@ -231,6 +245,7 @@ check "I·owns_its_control_table_and_roles" owns_its_control_table_and_roles
 check "I·idempotency_key_is_unique_per_tenant_and_sized" idempotency_key_is_unique_per_tenant_and_sized
 check "I·status_is_one_of_the_four_states_and_compensated_only_when_the_cancellation_was_refused" status_is_one_of_the_four_states_and_compensated_only_when_the_cancellation_was_refused
 check "I·failed_step_goes_with_a_failed_status_a_known_name_and_a_known_reason" failed_step_goes_with_a_failed_status_a_known_name_and_a_known_reason
+check "I·defaults_start_a_saga_running_at_version_zero_and_a_reservation_pending" defaults_start_a_saga_running_at_version_zero_and_a_reservation_pending
 check "I·the_request_is_bounded" the_request_is_bounded
 check "I·the_departure_id_and_the_instant_of_the_cancellation_are_kept_together" the_departure_id_and_the_instant_of_the_cancellation_are_kept_together
 check "I·a_step_is_recorded_once_with_a_known_name_and_number" a_step_is_recorded_once_with_a_known_name_and_number
