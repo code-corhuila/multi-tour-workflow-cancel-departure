@@ -71,7 +71,7 @@ func admin(mutate func(jwt.MapClaims)) jwt.MapClaims {
 
 // service is the token of job 3: the role SERVICE and no tenant.
 func service(mutate func(jwt.MapClaims)) jwt.MapClaims {
-	c := jwt.MapClaims{"sub": "multi-tour-worker-departure-deadlines", "roles": []string{"SERVICE"}, "iss": issuer, "aud": []string{audience},
+	c := jwt.MapClaims{"sub": "worker-departure-deadlines", "roles": []string{"SERVICE"}, "iss": issuer, "aud": []string{audience},
 		"exp": time.Now().Add(time.Hour).Unix()}
 	if mutate != nil {
 		mutate(c)
