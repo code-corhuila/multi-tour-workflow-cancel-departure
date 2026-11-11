@@ -1,0 +1,69 @@
+name: Board environment tracking
+
+# When a pull request is merged into develop, qa or main, set the Environment
+# field (Dev / QA / Main) of the user story it references on the team board.
+#
+# Setup, once per repository (Settings -> Secrets and variables -> Actions -> Variables):
+#   BOARD_NUMBER  number of the team board in the organization, 28
+#   DOCS_REPO     documentation repository of the team, multi-tour-docs
+# The token is the organization secret PROJECT_TOKEN_CODE_CORHUILA.
+#
+# The pull request must reference the story as:  code-corhuila/<DOCS_REPO>#NN
+
+on:
+  pull_request:
+    types: [closed]
+    branches: [develop, qa, main]
+
+permissions:
+  contents: read
+
+jobs:
+  track:
+    if: github.event.pull_request.merged == true
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/github-script@v7
+        env:
+          BOARD_NUMBER: ${{ vars.BOARD_NUMBER }}
+          DOCS_REPO: ${{ vars.DOCS_REPO }}
+        with:
+          github-token: ${{ secrets.PROJECT_TOKEN_CODE_CORHUILA }}
+          script: |
+            const ORG = 'code-corhuila';
+            const board = parseInt(process.env.BOARD_NUMBER || '', 10);
+            const docs = process.env.DOCS_REPO;
+            if (!board || !docs) { core.warning('BOARD_NUMBER or DOCS_REPO is not set.'); return; }
+
+            const ENV_BY_BRANCH = { develop: 'Dev', qa: 'QA', main: 'Main' };
+            const target = ENV_BY_BRANCH[context.payload.pull_request.base.ref];
+            if (!target) return;
+
+            const pr = context.payload.pull_request;
+            const text = `${pr.title}\n${pr.body || ''}`;
+            const re = new RegExp(`${docs}#(\\d+)`, 'g');
+            const stories = new Set([...text.matchAll(re)].map(m => parseInt(m[1], 10)));
+            if (!stories.size) { core.warning(`No reference to ${docs}#NN in the pull request.`); return; }
+
+            const p = await github.graphql(`query($o:String!,$n:Int!){ organization(login:$o){
+              projectV2(number:$n){ id field(name:"Environment"){
+                ... on ProjectV2SingleSelectField { id options { id name } } } } } }`,
+              { o: ORG, n: board });
+            const project = p.organization.projectV2;
+            const option = project.field.options.find(o => o.name === target);
+            if (!option) { core.warning(`Board has no Environment option named ${target}.`); return; }
+
+            for (const n of stories) {
+              const r = await github.graphql(`query($o:String!,$r:String!,$n:Int!){
+                repository(owner:$o,name:$r){ issue(number:$n){
+                  projectItems(first:20){ nodes { id project { id } } } } } }`,
+                { o: ORG, r: docs, n });
+              const item = r.repository.issue?.projectItems.nodes.find(x => x.project.id === project.id);
+              if (!item) { core.info(`#${n} is not on the board; skipped.`); continue; }
+              await github.graphql(`mutation($p:ID!,$i:ID!,$f:ID!,$o:String!){
+                updateProjectV2ItemFieldValue(input:{projectId:$p,itemId:$i,fieldId:$f,
+                  value:{singleSelectOptionId:$o}}){ projectV2Item { id } } }`,
+                { p: project.id, i: item.id, f: project.field.id, o: option.id });
+              core.info(`Story #${n}: Environment = ${target}`);
+            }
