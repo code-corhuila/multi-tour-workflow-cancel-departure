@@ -73,6 +73,8 @@ type fakeReservations struct {
 	voidErr error
 	voids   []voidCall
 	opens   []openCall
+	// block makes every call to open an episode wait until its context ends, like a participant that does not answer
+	block bool
 	// open decides each call to open an episode by its position (0 is the first)
 	open func(n int, c openCall) error
 }
@@ -96,12 +98,16 @@ func (f *fakeReservations) VoidProposals(ctx context.Context, tenantID, departur
 }
 
 func (f *fakeReservations) OpenEpisode(ctx context.Context, tenantID, reservationID, departureID string, at time.Time, key string) error {
-	if ctx.Err() != nil {
-		return ctx.Err()
-	}
 	c := openCall{tenantID, reservationID, departureID, at, key}
 	f.opens = append(f.opens, c)
 	*f.log = append(*f.log, "open:"+reservationID)
+	if f.block {
+		<-ctx.Done()
+		return ctx.Err()
+	}
+	if ctx.Err() != nil {
+		return ctx.Err()
+	}
 	if f.open == nil {
 		return nil
 	}
@@ -756,9 +762,12 @@ func TestA_a_context_that_ends_stops_the_loop_instead_of_asking_every_reservatio
 }
 
 // One saga that is slow must not eat the whole pass: each resumed saga has its own budget, and the next one is attempted.
+
+// One saga whose participant never answers must not eat the whole pass: each resumed saga has its own budget, and the next one is attempted.
 func TestA_each_resumed_saga_has_its_own_budget_so_a_slow_one_does_not_starve_the_next(t *testing.T) {
 	r := newRig()
 	r.uc.WithResumeBudget(50 * time.Millisecond)
+	r.res.block = true
 	for _, key := range []string{"key-0000001", "key-0000002"} {
 		stopped := saga.New(tenant, key, code, now.Add(-time.Hour))
 		stopped.DepartureID, stopped.CancelledAt = departure, cancelledAt
@@ -768,13 +777,14 @@ func TestA_each_resumed_saga_has_its_own_budget_so_a_slow_one_does_not_starve_th
 		stored.UpdatedAt = now.Add(-time.Hour)
 		r.store.byID[stored.ID] = stored
 	}
-	r.res.open = func(int, openCall) error { return errors.New("down") } // does not block: it fails, and the budget is the cap anyway
-	started := time.Now()
-	resumed, err := r.resume()
-	if err != nil || resumed != 2 || len(r.res.opens) != 2 {
-		t.Fatalf("resumed %d, episodes asked %d, err %v: both sagas must be attempted", resumed, len(r.res.opens), err)
-	}
-	if time.Since(started) > 2*time.Second {
-		t.Fatalf("took %v", time.Since(started))
+	done := make(chan int, 1)
+	go func() { n, _ := r.resume(); done <- n }()
+	select {
+	case resumed := <-done:
+		if resumed != 2 || len(r.res.opens) != 2 {
+			t.Fatalf("resumed %d, episodes asked %d: both sagas must be attempted", resumed, len(r.res.opens))
+		}
+	case <-time.After(3 * time.Second):
+		t.Fatal("the pass is still waiting on the first saga: a resumed saga has no budget of its own")
 	}
 }

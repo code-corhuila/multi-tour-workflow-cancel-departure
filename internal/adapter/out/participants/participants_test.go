@@ -311,7 +311,7 @@ func TestC_a_cancelled_context_stops_the_attempts(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	cancel()
 	_, err := participants.NewOperations(srv.URL, cfg).CancelDeparture(ctx, tenant, "SAL-013", "k-0000001")
-	if err == nil || srv.count() > 1 {
+	if err == nil || errors.Is(err, out.ErrRefused) || errors.Is(err, out.ErrNotFound) || srv.count() > 1 {
 		t.Fatalf("err %v, %d requests", err, srv.count())
 	}
 }
