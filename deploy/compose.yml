@@ -1,0 +1,74 @@
+# The migration runner of the saga schema and the saga itself. It defines no database and no volume: the instance is that of
+# multi-tour-infra-postgres, which includes this file in the root composition (Annex J, J.7).
+# The runner does not start with `up`; run it once per environment:
+#   docker compose --env-file env/dev.env run --rm workflow-cancel-departure-db-migrate
+services:
+  workflow-cancel-departure-db-migrate:
+    # Liquibase 5.0.4 plus the PostgreSQL driver, at exact versions (see liquibase.Dockerfile)
+    build:
+      context: .
+      dockerfile: liquibase.Dockerfile
+    image: multi-tour-workflow-cancel-departure-liquibase:5.0.4
+    profiles: [tooling]
+    depends_on:
+      postgres:
+        condition: service_healthy
+    environment:
+      LIQUIBASE_COMMAND_URL: jdbc:postgresql://postgres:5432/${PG_DATABASE:?PG_DATABASE is required, set it in env/<environment>.env}
+      LIQUIBASE_COMMAND_USERNAME: ${PG_ADMIN_USER:?PG_ADMIN_USER is required, set it in env/<environment>.env}
+      LIQUIBASE_COMMAND_PASSWORD: ${PG_ADMIN_PASSWORD:?PG_ADMIN_PASSWORD is required, set it in env/<environment>.env}
+    volumes:
+      - ../db:/workspace:ro
+    # Own control table, so two domains never share one (Annex J, J.6)
+    command:
+      - --search-path=/workspace
+      - --changelog-file=changelog/changelog-master.yaml
+      - --database-changelog-table-name=databasechangelog_workflow_cancel_departure
+      - --database-changelog-lock-table-name=databasechangeloglock_workflow_cancel_departure
+      - update
+    networks: [platform]
+
+  # The saga itself. It publishes no port: the api gateway is the only door (norm 5.6.1), and it reaches it at the port 8090 under the name
+  # multi-tour-workflow-cancel-departure. Run the migrator first. The secrets come from env/<environment>.env of
+  # multi-tour-infra-postgres; the names inside the container are those of .env.example. A variable left empty is refused by the service at
+  # start, by name. The public key file must be readable by user 10001 (mode 644: it is public).
+  # stop_grace_period outlasts the budget of the start of a saga (60 s) plus the grace of the server (65 s in all), so a stop lets a running request
+  # answer; what a saga has not finished by then is saved RUNNING and goes on after the next start.
+  workflow-cancel-departure:
+    build:
+      context: ..
+      dockerfile: Dockerfile
+    image: multi-tour-workflow-cancel-departure:0.1.0
+    depends_on:
+      postgres:
+        condition: service_healthy
+    expose:
+      - "8090"
+    environment:
+      LISTEN_ADDR: ":8090"
+      COMMERCIAL_RESERVATION_BASE_URL: ${COMMERCIAL_RESERVATION_BASE_URL:-http://multi-tour-commercial-reservation-api:8083}
+      OPERATIONS_COST_BASE_URL: ${OPERATIONS_COST_BASE_URL:-http://multi-tour-operations-cost-api:8084}
+      SERVICE_TOKEN: ${WORKFLOW_CANCEL_DEPARTURE_SERVICE_TOKEN:-}
+      JWT_PUBLIC_KEY_FILE: /run/secrets/jwt_public.pem
+      JWT_ISSUER: ${JWT_ISSUER:-multi-tour-security}
+      JWT_AUDIENCE: ${JWT_AUDIENCE:-multi-tour}
+      DATABASE_URL: ${WORKFLOW_CANCEL_DEPARTURE_DATABASE_URL:-}
+      STEP_TIMEOUT: ${STEP_TIMEOUT:-5s}
+      STEP_ATTEMPTS: ${STEP_ATTEMPTS:-3}
+    volumes:
+      - ${JWT_PUBLIC_KEY_PATH:-/dev/null}:/run/secrets/jwt_public.pem:ro
+    healthcheck:
+      test: ["CMD", "wget", "-q", "-O", "/dev/null", "http://127.0.0.1:8090/health"]
+      interval: 10s
+      timeout: 3s
+      retries: 5
+      start_period: 10s
+    networks:
+      platform:
+        aliases: [multi-tour-workflow-cancel-departure]
+    stop_grace_period: 90s
+    restart: unless-stopped
+
+networks:
+  platform:
+    external: true
