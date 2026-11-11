@@ -14,6 +14,9 @@ var (
 	ErrNotFound = errors.New("not found")
 	ErrRefused  = errors.New("refused by a rule of the participant")
 	ErrStale    = errors.New("the saga changed since it was read")
+	// ErrPendingReservations is a save that would close a saga COMPLETED while one of its reservations is still PENDING. The resumption only looks for
+	// RUNNING sagas, so that reservation would be lost; the rule crosses two tables, so the store keeps it and not a CHECK.
+	ErrPendingReservations = errors.New("a saga with a pending reservation cannot be completed")
 )
 
 // Cancellation is what operations-cost answers when it cancels a departure: the id of the departure, which commercial-reservation takes on
