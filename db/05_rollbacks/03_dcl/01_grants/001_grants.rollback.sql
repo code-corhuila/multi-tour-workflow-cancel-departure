@@ -1,0 +1,5 @@
+REVOKE workflow_cancel_departure_writer FROM workflow_cancel_departure_app;
+ALTER DEFAULT PRIVILEGES IN SCHEMA workflow_cancel_departure REVOKE SELECT, INSERT, UPDATE ON TABLES FROM workflow_cancel_departure_writer;
+ALTER DEFAULT PRIVILEGES IN SCHEMA workflow_cancel_departure REVOKE SELECT ON TABLES FROM workflow_cancel_departure_reader;
+REVOKE ALL ON ALL TABLES IN SCHEMA workflow_cancel_departure FROM workflow_cancel_departure_reader, workflow_cancel_departure_writer;
+REVOKE ALL ON SCHEMA workflow_cancel_departure FROM workflow_cancel_departure_reader, workflow_cancel_departure_writer;

@@ -1,0 +1,1 @@
+DROP INDEX IF EXISTS workflow_cancel_departure.idx_cancel_departure_saga_status_updated_at;
