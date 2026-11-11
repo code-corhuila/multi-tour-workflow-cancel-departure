@@ -1,0 +1,2 @@
+ALTER TABLE workflow_cancel_departure.cancel_departure_saga_reservation DROP CONSTRAINT IF EXISTS fk_cancel_departure_saga_reservation_saga;
+ALTER TABLE workflow_cancel_departure.cancel_departure_saga_step DROP CONSTRAINT IF EXISTS fk_cancel_departure_saga_step_saga;

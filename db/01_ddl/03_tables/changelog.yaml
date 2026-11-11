@@ -1,0 +1,18 @@
+databaseChangeLog:
+  - changeSet:
+      id: cancel-departure-ddl-tables-001
+      author: Molina211
+      labels: "HU-WFL-004,ddl,tables"
+      comment: "The cancel-departure saga, its steps and its reservations, saved after every step and every reservation so a restart can go on (Annex E, rule 2)."
+      changes:
+        - sqlFile:
+            path: 001_create_cancel_departure_saga.sql
+            relativeToChangelogFile: true
+            splitStatements: false
+            stripComments: false
+      rollback:
+        - sqlFile:
+            path: ../../05_rollbacks/01_ddl/03_tables/001_create_cancel_departure_saga.rollback.sql
+            relativeToChangelogFile: true
+            splitStatements: false
+            stripComments: false
