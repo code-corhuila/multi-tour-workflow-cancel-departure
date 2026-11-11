@@ -70,6 +70,8 @@ func newServer(t *testing.T, replies ...reply) *server {
 
 func (s *server) count() int { s.mu.Lock(); defer s.mu.Unlock(); return len(s.requests) }
 
+const openedBody = `{"reschedulingId":"77777777-7777-4777-8777-777777777777","reservationId":"66666666-6666-4666-8666-666666666661"}`
+
 const cancelled = `{"departureId":"55555555-5555-4555-8555-555555555555","cancelledAt":"2026-11-11T08:50:00Z"}`
 
 // AC-WF4-01.11: every call carries the service token, the tenant in the path, the derived key and the correlation id.
@@ -115,7 +117,7 @@ func TestC_a_cancellation_without_a_usable_id_or_instant_is_unclear(t *testing.T
 
 func TestC_the_episode_is_opened_with_the_reservation_the_departure_and_the_instant_and_both_successes_are_a_yes(t *testing.T) {
 	for _, status := range []int{201, 200} {
-		srv := newServer(t, reply{status, `{"reschedulingId":"77777777-7777-4777-8777-777777777777"}`})
+		srv := newServer(t, reply{status, openedBody})
 		err := participants.NewReservations(srv.URL, cfg).OpenEpisode(context.Background(), tenant, reservation, departure, cancelledAt, "saga-1:OPEN_EPISODE:"+reservation)
 		if err != nil {
 			t.Fatalf("status %d: err %v", status, err)
@@ -261,7 +263,7 @@ func TestC_a_tenant_or_a_departure_that_is_not_an_id_is_refused_before_any_call(
 // ADR-004 D10: network errors, 429 and 5xx are repeated with the same key; nothing else is.
 func TestC_transient_answers_are_repeated_with_the_same_key_and_then_succeed(t *testing.T) {
 	for _, status := range []int{500, 502, 503, 429} {
-		srv := newServer(t, reply{status, `{}`}, reply{201, `{}`})
+		srv := newServer(t, reply{status, `{}`}, reply{201, openedBody})
 		err := participants.NewReservations(srv.URL, cfg).OpenEpisode(context.Background(), tenant, reservation, departure, cancelledAt, "same-key-1")
 		if err != nil || srv.count() != 2 || srv.requests[0].Key != srv.requests[1].Key {
 			t.Fatalf("status %d: err %v, requests %d", status, err, srv.count())
@@ -311,5 +313,93 @@ func TestC_a_cancelled_context_stops_the_attempts(t *testing.T) {
 	_, err := participants.NewOperations(srv.URL, cfg).CancelDeparture(ctx, tenant, "SAL-013", "k-0000001")
 	if err == nil || srv.count() > 1 {
 		t.Fatalf("err %v, %d requests", err, srv.count())
+	}
+}
+
+// The saga keeps what the list says and decides on it: a list that may be incomplete is not a yes, because the reservations it lacks would get no
+// episode and no refund and the saga would end COMPLETED.
+func TestC_a_list_that_may_be_incomplete_is_unclear(t *testing.T) {
+	row := `{"reservationId":"` + reservation + `"}`
+	for name, body := range map[string]string{
+		"no total pages":       `{"data":[` + row + `],"meta":{"page":1,"limit":100,"total":1}}`,
+		"zero pages with data": `{"data":[` + row + `],"meta":{"page":1,"limit":100,"total":1,"totalPages":0}}`,
+		"another page":         `{"data":[` + row + `],"meta":{"page":2,"limit":100,"total":1,"totalPages":1}}`,
+		"no data":              `{"data":null,"meta":{"page":1,"limit":100,"total":0,"totalPages":0}}`,
+		"fewer ids than total": `{"data":[` + row + `],"meta":{"page":1,"limit":100,"total":5,"totalPages":1}}`,
+		"no total":             `{"data":[` + row + `],"meta":{"page":1,"limit":100,"totalPages":1}}`,
+	} {
+		srv := newServer(t, reply{200, body})
+		_, err := participants.NewReservations(srv.URL, cfg).ListAffected(context.Background(), tenant, departure)
+		if err == nil || errors.Is(err, out.ErrRefused) || errors.Is(err, out.ErrNotFound) {
+			t.Fatalf("%s: err %v, want an unclear answer", name, err)
+		}
+	}
+}
+
+func TestC_a_page_that_fails_gives_no_partial_list(t *testing.T) {
+	srv := newServer(t, reply{200, `{"data":[{"reservationId":"` + reservation + `"}],"meta":{"page":1,"limit":100,"total":101,"totalPages":2}}`}, reply{503, `{}`})
+	ids, err := participants.NewReservations(srv.URL, cfg).ListAffected(context.Background(), tenant, departure)
+	if err == nil || ids != nil {
+		t.Fatalf("ids %v, err %v: the second page failed, so there is no list", ids, err)
+	}
+}
+
+// The instant goes to the participants in seconds, in UTC; the saga saves the same one it sends, so a resumption sends it again unchanged.
+func TestC_the_instant_of_the_cancellation_is_cut_to_the_second_in_utc_when_it_is_received(t *testing.T) {
+	srv := newServer(t, reply{200, `{"departureId":"` + departure + `","cancelledAt":"2026-11-11T03:50:00.987654-05:00"}`})
+	got, err := participants.NewOperations(srv.URL, cfg).CancelDeparture(context.Background(), tenant, "SAL-013", "k-0000001")
+	if err != nil || !got.CancelledAt.Equal(cancelledAt) || got.CancelledAt.Location() != time.UTC || got.CancelledAt.Nanosecond() != 0 {
+		t.Fatalf("instant %v, err %v: want 2026-11-11T08:50:00Z", got.CancelledAt, err)
+	}
+}
+
+// Opening an episode and voiding the proposals are decisions of the saga that cannot be undone: a success that does not say what the contract promises
+// (a proxy, a route that is not the one) is not a yes.
+func TestC_a_success_without_the_answer_of_the_contract_is_unclear(t *testing.T) {
+	res := func(srv *server) *participants.Reservations { return participants.NewReservations(srv.URL, cfg) }
+	for name, rep := range map[string]reply{
+		"empty object": {201, `{}`}, "garbage": {200, `<html>ok</html>`}, "no content": {204, ``}, "accepted": {202, openedBody},
+		"another reservation": {201, `{"reschedulingId":"77777777-7777-4777-8777-777777777777","reservationId":"66666666-6666-4666-8666-666666666662"}`},
+	} {
+		srv := newServer(t, rep)
+		if err := res(srv).OpenEpisode(context.Background(), tenant, reservation, departure, cancelledAt, "k-0000001"); err == nil || errors.Is(err, out.ErrRefused) {
+			t.Fatalf("open, %s: err %v, want an unclear answer", name, err)
+		}
+	}
+	for name, rep := range map[string]reply{
+		"empty object": {200, `{}`}, "garbage": {200, `ok`}, "created": {201, `{"voidedProposals":0,"reschedulingIds":[]}`}, "no content": {204, ``},
+	} {
+		srv := newServer(t, rep)
+		if err := res(srv).VoidProposals(context.Background(), tenant, departure, cancelledAt, "k-0000001"); err == nil || errors.Is(err, out.ErrRefused) {
+			t.Fatalf("void, %s: err %v, want an unclear answer", name, err)
+		}
+	}
+}
+
+// A refusal says which status it was and never what the participant wrote: the orchestrator logs it, and a 400 of ours must not look like a rule.
+func TestC_a_refusal_carries_its_status_and_none_of_the_text_of_the_participant(t *testing.T) {
+	srv := newServer(t, reply{400, `{"error":"VALIDATION_ERROR","message":"secret detail of the participant","traceId":"t"}`})
+	_, err := participants.NewOperations(srv.URL, cfg).CancelDeparture(context.Background(), tenant, "SAL-013", "k-0000001")
+	if !errors.Is(err, out.ErrRefused) || !strings.Contains(err.Error(), "400") || strings.Contains(err.Error(), "secret") {
+		t.Fatalf("err %v", err)
+	}
+	srv = newServer(t, reply{404, `{"message":"secret detail"}`})
+	err = participants.NewReservations(srv.URL, cfg).VoidProposals(context.Background(), tenant, departure, cancelledAt, "k-0000001")
+	if !errors.Is(err, out.ErrNotFound) || !strings.Contains(err.Error(), "404") || strings.Contains(err.Error(), "secret") {
+		t.Fatalf("err %v", err)
+	}
+}
+
+// ADR-004 D10: three attempts with a base wait of 200 ms unless the composition root says otherwise; a configuration left at zero must not turn
+// the retries off without a word.
+func TestC_the_defaults_are_the_attempts_and_the_wait_of_the_plan(t *testing.T) {
+	srv := newServer(t, reply{503, `{}`}, reply{503, `{}`}, reply{200, cancelled})
+	started := time.Now()
+	_, err := participants.NewOperations(srv.URL, participants.Config{Token: token}).CancelDeparture(context.Background(), tenant, "SAL-013", "k-0000001")
+	if err != nil || srv.count() != 3 {
+		t.Fatalf("err %v, requests %d: want three attempts by default", err, srv.count())
+	}
+	if time.Since(started) > 2*time.Second {
+		t.Fatalf("took %v: the waits are bounded by the base and its doubling", time.Since(started))
 	}
 }
