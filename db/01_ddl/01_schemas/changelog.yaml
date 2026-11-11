@@ -1,0 +1,18 @@
+databaseChangeLog:
+  - changeSet:
+      id: cancel-departure-ddl-schemas-001
+      author: Molina211
+      labels: "HU-WFL-004,ddl,schemas"
+      comment: "Create the workflow_cancel_departure schema, the state of this saga (ADR-005 E4). Nothing of this service lives in public."
+      changes:
+        - sqlFile:
+            path: 001_create_schema_workflow.sql
+            relativeToChangelogFile: true
+            splitStatements: false
+            stripComments: false
+      rollback:
+        - sqlFile:
+            path: ../../05_rollbacks/01_ddl/01_schemas/001_create_schema_workflow.rollback.sql
+            relativeToChangelogFile: true
+            splitStatements: false
+            stripComments: false

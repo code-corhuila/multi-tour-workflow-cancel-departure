@@ -1,0 +1,1 @@
+CREATE INDEX IF NOT EXISTS idx_cancel_departure_saga_status_updated_at ON workflow_cancel_departure.cancel_departure_saga (saga_status, updated_at);

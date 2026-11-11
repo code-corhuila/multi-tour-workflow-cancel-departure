@@ -1,0 +1,18 @@
+databaseChangeLog:
+  - changeSet:
+      id: cancel-departure-dcl-roles-001
+      author: Molina211
+      labels: "HU-WFL-004,dcl,roles"
+      comment: "Reader and writer roles of the schema. They carry permissions and cannot log in."
+      changes:
+        - sqlFile:
+            path: 001_create_roles.sql
+            relativeToChangelogFile: true
+            splitStatements: false
+            stripComments: false
+      rollback:
+        - sqlFile:
+            path: ../../05_rollbacks/03_dcl/00_roles/001_create_roles.rollback.sql
+            relativeToChangelogFile: true
+            splitStatements: false
+            stripComments: false
