@@ -167,3 +167,21 @@ func TestC_the_start_gets_a_deadline_and_the_read_does_not(t *testing.T) {
 		t.Fatal("a read has no budget of its own")
 	}
 }
+
+// The budget never lengthens a deadline that is already shorter, and what ends the request ends the saga's start too.
+func TestC_the_budget_keeps_a_shorter_deadline_and_follows_the_cancellation_of_the_request(t *testing.T) {
+	inner := &fakeUseCase{}
+	uc := budgeted{inner}
+	short, stopShort := context.WithTimeout(context.Background(), 2*time.Second)
+	defer stopShort()
+	uc.Start(short, in.StartCommand{})
+	if deadline, _ := inner.startCtx.Deadline(); time.Until(deadline) > 2*time.Second {
+		t.Fatalf("deadline %v: a shorter one of the request must stay", deadline)
+	}
+	parent, cancel := context.WithCancel(context.Background())
+	uc.Start(parent, in.StartCommand{})
+	cancel()
+	if inner.startCtx.Err() == nil {
+		t.Fatal("the start did not follow the cancellation of its request")
+	}
+}
