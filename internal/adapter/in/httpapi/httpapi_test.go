@@ -172,10 +172,17 @@ func TestC_every_contract_operation_is_exercised(t *testing.T) {
 		uc   *fakeUseCase
 		want int
 	}
-	okUC := func(created bool) *fakeUseCase { return &fakeUseCase{started: completed(), created: created, found: completed()} }
+	okUC := func(created bool) *fakeUseCase {
+		return &fakeUseCase{started: completed(), created: created, found: completed()}
+	}
 	failedSaga := completed()
 	failedSaga.Reservations = []saga.Reservation{{ID: reservation, State: saga.EpisodeFailed}}
 	failedSaga.End(saga.Failed, saga.OpenEpisodes, saga.ReservationsFailed, failedSaga.UpdatedAt)
+
+	refusedSaga, runningSaga := completed(), completed()
+	refusedSaga.Steps, refusedSaga.Reservations = nil, nil
+	refusedSaga.End(saga.Compensated, saga.CancelDeparture, saga.DepartureRefused, refusedSaga.UpdatedAt)
+	runningSaga.Status, runningSaga.Steps = saga.Running, []saga.Step{saga.CancelDeparture}
 
 	var scenarios []scenario
 	for _, p := range []struct {
@@ -194,6 +201,9 @@ func TestC_every_contract_operation_is_exercised(t *testing.T) {
 		badType.contentType = "text/plain"
 		scenarios = append(scenarios,
 			scenario{p.name + " created", p.build(), &fakeUseCase{started: failedSaga, created: true}, http.StatusCreated},
+			scenario{p.name + " created compensated", p.build(), &fakeUseCase{started: refusedSaga, created: true}, http.StatusCreated},
+			scenario{p.name + " created running", p.build(), &fakeUseCase{started: runningSaga, created: true}, http.StatusCreated},
+			scenario{p.name + " repeated while running", p.build(), &fakeUseCase{started: runningSaga, created: false}, http.StatusOK},
 			scenario{p.name + " repeated key", p.build(), okUC(false), http.StatusOK},
 			scenario{p.name + " no token", noAuth, okUC(true), http.StatusUnauthorized},
 			scenario{p.name + " wrong role", forbidden, okUC(true), http.StatusForbidden},
@@ -301,7 +311,7 @@ func TestC_job_3_starts_the_saga_for_the_tenant_of_the_path(t *testing.T) {
 	if loc := rec.Header().Get("Location"); loc != route+"/"+sagaID {
 		t.Errorf("Location %q", loc)
 	}
-	for _, bad := range []string{"not-an-id", "..", "a%2Fb"} {
+	for _, bad := range []string{"not-an-id", "a%2Fb"} { // a ".." never reaches the handler: the mux cleans the path
 		c := postInternal(t, goodBody)
 		c.path = "/api/v1/sagas/internal/tenants/" + bad + "/cancel-departure"
 		uc := &fakeUseCase{}
@@ -468,5 +478,100 @@ func TestC_health_answers_without_a_token(t *testing.T) {
 	rec := call{method: http.MethodGet, path: "/health"}.send(newHandler(&fakeUseCase{}, &bytes.Buffer{}))
 	if rec.Code != http.StatusOK {
 		t.Errorf("status %d", rec.Code)
+	}
+}
+
+// A token service of the platform is the role SERVICE alone and names no tenant; one that is also a tenant administrator, or that names a tenant,
+// is not what job 3 carries and does not get in.
+func TestC_a_service_token_is_the_role_service_alone_and_names_no_tenant(t *testing.T) {
+	for name, cl := range map[string]jwt.MapClaims{
+		"a service that names a tenant":           service(func(c jwt.MapClaims) { c["tenantId"] = tenantID }),
+		"a service that is also an administrator": service(func(c jwt.MapClaims) { c["roles"] = []string{"SERVICE", "TENANT_ADMINISTRATOR"} }),
+	} {
+		c := postInternal(t, goodBody)
+		c.bearer = token(t, signer, cl)
+		uc := &fakeUseCase{started: completed(), created: true}
+		if rec := c.send(newHandler(uc, &bytes.Buffer{})); rec.Code != http.StatusForbidden || uc.startCtx != nil {
+			t.Errorf("%s: status %d, started %v", name, rec.Code, uc.startCtx != nil)
+		}
+	}
+}
+
+// The check of the token: RS256 only (never none, never HS256 signed with the public key), exp, sub, the issuer and the audience, claims of the
+// right type, and a leeway of 30 seconds.
+func TestC_the_token_is_checked_as_the_platform_says(t *testing.T) {
+	asHMAC := func(cl jwt.MapClaims) string {
+		signed, _ := jwt.NewWithClaims(jwt.SigningMethodHS256, cl).SignedString([]byte("-----BEGIN PUBLIC KEY-----"))
+		return signed
+	}
+	none, _ := jwt.NewWithClaims(jwt.SigningMethodNone, admin(nil)).SignedString(jwt.UnsafeAllowNoneSignatureType)
+	bad := map[string]string{
+		"alg none":           none,
+		"HS256":              asHMAC(admin(nil)),
+		"no exp":             token(t, signer, admin(func(c jwt.MapClaims) { delete(c, "exp") })),
+		"no sub":             token(t, signer, admin(func(c jwt.MapClaims) { delete(c, "sub") })),
+		"another audience":   token(t, signer, admin(func(c jwt.MapClaims) { c["aud"] = []string{"other"} })),
+		"roles as a text":    token(t, signer, admin(func(c jwt.MapClaims) { c["roles"] = "TENANT_ADMINISTRATOR" })),
+		"tenantId as number": token(t, signer, admin(func(c jwt.MapClaims) { c["tenantId"] = 7 })),
+		"expired 40 s ago":   token(t, signer, admin(func(c jwt.MapClaims) { c["exp"] = time.Now().Add(-40 * time.Second).Unix() })),
+	}
+	for name, tok := range bad {
+		c := get(t, sagaID)
+		c.bearer = tok
+		if rec := c.send(newHandler(&fakeUseCase{found: completed()}, &bytes.Buffer{})); rec.Code != http.StatusUnauthorized && rec.Code != http.StatusForbidden {
+			t.Errorf("%s: status %d, want a refusal", name, rec.Code)
+		}
+	}
+	c := get(t, sagaID)
+	c.bearer = token(t, signer, admin(func(cl jwt.MapClaims) { cl["exp"] = time.Now().Add(-20 * time.Second).Unix() }))
+	if rec := c.send(newHandler(&fakeUseCase{found: completed()}, &bytes.Buffer{})); rec.Code != http.StatusOK {
+		t.Errorf("expired 20 s ago: status %d, the leeway is 30 s", rec.Code)
+	}
+}
+
+func TestC_only_the_bearer_scheme_with_a_token_is_accepted(t *testing.T) {
+	good := token(t, signer, admin(nil))
+	for header, want := range map[string]int{"Basic " + good: 401, "Bearer ": 401, "Bearer": 401, "bearer " + good: 200, "Bearer " + good: 200} {
+		req := httptest.NewRequest(http.MethodGet, route+"/"+sagaID, nil)
+		req.Header.Set("Authorization", header)
+		rec := httptest.NewRecorder()
+		newHandler(&fakeUseCase{found: completed()}, &bytes.Buffer{}).ServeHTTP(rec, req)
+		if rec.Code != want {
+			t.Errorf("%q: status %d, want %d", header[:min(len(header), 12)], rec.Code, want)
+		}
+	}
+}
+
+// The database checks the key in characters, so the entry counts characters too: a key of multibyte characters that is too short is a 400 and not a
+// 500 from the store.
+func TestC_the_key_is_counted_in_characters_and_must_be_valid_text(t *testing.T) {
+	for name, key := range map[string]string{"multibyte short": "éééé", "invalid utf8": "abcd\xff\xfe\xfd\xfc", "too long": strings.Repeat("k", 129)} {
+		c := post(t, goodBody)
+		c.key = key
+		uc := &fakeUseCase{started: completed(), created: true}
+		if rec := c.send(newHandler(uc, &bytes.Buffer{})); rec.Code != http.StatusBadRequest || uc.startCtx != nil {
+			t.Errorf("%s: status %d, started %v", name, rec.Code, uc.startCtx != nil)
+		}
+	}
+}
+
+// A method a route does not take is a 405 with the envelope and the Allow header.
+func TestC_a_method_a_route_does_not_take_is_a_405_with_its_allow_header(t *testing.T) {
+	for _, tc := range []struct{ method, path, allow string }{
+		{http.MethodGet, route, "POST"}, {http.MethodPost, route + "/" + sagaID, "GET"}, {http.MethodGet, internalRoute, "POST"},
+	} {
+		rec := call{method: tc.method, path: strings.Replace(tc.path, "{tenantId}", tenantID, 1), bearer: token(t, signer, admin(nil))}.send(newHandler(&fakeUseCase{}, &bytes.Buffer{}))
+		if rec.Code != http.StatusMethodNotAllowed || rec.Header().Get("Allow") != tc.allow || !strings.Contains(rec.Body.String(), `"traceId"`) {
+			t.Errorf("%s %s: status %d, Allow %q", tc.method, tc.path, rec.Code, rec.Header().Get("Allow"))
+		}
+	}
+}
+
+func TestC_a_null_or_empty_body_is_refused(t *testing.T) {
+	for _, body := range []string{`{"departureCode":null}`, ``, `null`, `[]`} {
+		uc := &fakeUseCase{started: completed(), created: true}
+		if rec := post(t, body).send(newHandler(uc, &bytes.Buffer{})); rec.Code != http.StatusBadRequest || uc.startCtx != nil {
+			t.Errorf("%q: status %d, started %v", body, rec.Code, uc.startCtx != nil)
+		}
 	}
 }
