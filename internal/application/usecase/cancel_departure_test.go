@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"io"
 	"log/slog"
+	"slices"
 	"strings"
 	"testing"
 	"time"
@@ -108,16 +109,22 @@ type memStore struct {
 
 func newStore() *memStore { return &memStore{byID: map[string]saga.Saga{}} }
 
+// copyOf gives the slices of a saga their own memory: a database hands out copies, so a change of the orchestrator that is not saved must not show.
+func copyOf(s saga.Saga) saga.Saga {
+	s.Steps, s.Reservations = slices.Clone(s.Steps), slices.Clone(s.Reservations)
+	return s
+}
+
 func (m *memStore) Create(_ context.Context, s saga.Saga) (saga.Saga, bool, error) {
 	for _, existing := range m.byID {
 		if existing.TenantID == s.TenantID && existing.IdempotencyKey == s.IdempotencyKey {
-			return existing, false, nil
+			return copyOf(existing), false, nil
 		}
 	}
 	m.nextID++
 	s.ID = fmt.Sprintf("saga-%d", m.nextID)
-	m.byID[s.ID] = s
-	return s, true, nil
+	m.byID[s.ID] = copyOf(s)
+	return copyOf(s), true, nil
 }
 
 func (m *memStore) Save(_ context.Context, s saga.Saga) (saga.Saga, error) {
@@ -126,26 +133,26 @@ func (m *memStore) Save(_ context.Context, s saga.Saga) (saga.Saga, error) {
 		return saga.Saga{}, out.ErrStale
 	}
 	s.Version++
-	m.byID[s.ID] = s
+	m.byID[s.ID] = copyOf(s)
 	m.saves++
-	return s, nil
+	return copyOf(s), nil
 }
 
 func (m *memStore) Get(_ context.Context, tenantID, id string) (saga.Saga, error) {
 	if s, ok := m.byID[id]; ok && s.TenantID == tenantID {
-		return s, nil
+		return copyOf(s), nil
 	}
 	return saga.Saga{}, out.ErrNotFound
 }
 
 func (m *memStore) ListStale(_ context.Context, before time.Time, limit int) ([]saga.Saga, error) {
 	if m.listing != nil {
-		return m.listing, nil
+		return slices.Clone(m.listing), nil
 	}
 	var stale []saga.Saga
 	for _, s := range m.byID {
 		if s.Status == saga.Running && s.UpdatedAt.Before(before) {
-			stale = append(stale, s)
+			stale = append(stale, copyOf(s))
 		}
 	}
 	return stale, nil
@@ -186,7 +193,9 @@ func (r *rig) stale(id string, age time.Duration) {
 	r.store.byID[id] = s
 }
 
-func (r *rig) resume() (int, error) { return r.uc.Resume(context.Background(), now.Add(-2*time.Minute)) }
+func (r *rig) resume() (int, error) {
+	return r.uc.Resume(context.Background(), now.Add(-2*time.Minute))
+}
 
 func (r *rig) calls(prefix string) int {
 	n := 0
@@ -410,6 +419,9 @@ func TestA_a_refusal_to_void_the_proposals_ends_failed_naming_the_step(t *testin
 	r := newRig()
 	r.res.voidErr = out.ErrRefused
 	s, _, err := r.uc.Start(context.Background(), cmd("key-0000001"))
+	if r.res.lists != 0 || len(r.res.opens) != 0 {
+		t.Fatalf("lists %d, episodes %d: after a refused void nothing is listed or opened", r.res.lists, len(r.res.opens))
+	}
 	if err != nil || s.Status != saga.Failed || s.FailedStep != saga.VoidProposals || s.Reason != saga.ReservationsFailed {
 		t.Fatalf("status %s, failed step %s, reason %s, err %v", s.Status, s.FailedStep, s.Reason, err)
 	}
@@ -528,5 +540,143 @@ func TestA_get_reads_only_the_saga_of_the_tenant(t *testing.T) {
 	}
 	if _, err := r.uc.Get(context.Background(), otherTenant, s.ID); !errors.Is(err, out.ErrNotFound) {
 		t.Fatalf("err %v, want ErrNotFound for another tenant", err)
+	}
+}
+
+// Another instance moved the saga while this one was in the middle of it: no call follows a save that was refused, and the saga that comes
+// back from a failed save is not read.
+func TestA_a_stale_save_after_the_proposals_or_inside_the_loop_asks_nothing_more(t *testing.T) {
+	cases := map[int][]string{
+		2: {"cancel", "void"},                           // the save after the proposals
+		3: {"cancel", "void", "list"},                   // the save of the list
+		4: {"cancel", "void", "list", "open:" + rid(1)}, // the save after the first reservation
+	}
+	for failSave, want := range cases {
+		r := newRig()
+		r.store.failSave = failSave
+		_, _, err := r.uc.Start(context.Background(), cmd("key-0000001"))
+		if !errors.Is(err, out.ErrStale) || !inOrder(*r.log, want) {
+			t.Fatalf("save %d refused: err %v, calls %v, want ErrStale and %v", failSave, err, *r.log, want)
+		}
+	}
+}
+
+// An answer that is not clear in step 1, 2 or 3 is asked again with the same key, and the instant of the cancellation does not change.
+func TestA_an_unclear_cancellation_is_asked_again_with_the_same_key_and_keeps_its_instant(t *testing.T) {
+	r := newRig()
+	r.ops.answer = func(n int) (out.Cancellation, error) {
+		if n == 0 {
+			return out.Cancellation{}, errors.New("connection reset")
+		}
+		return out.Cancellation{DepartureID: departure, CancelledAt: cancelledAt}, nil
+	}
+	first, _, _ := r.uc.Start(context.Background(), cmd("key-0000001"))
+	r.stale(first.ID, time.Hour)
+	if resumed, err := r.resume(); err != nil || resumed != 1 {
+		t.Fatalf("resumed %d, err %v", resumed, err)
+	}
+	got := r.store.byID[first.ID]
+	if got.Status != saga.Completed || !got.CancelledAt.Equal(cancelledAt) {
+		t.Fatalf("status %s, instant %v", got.Status, got.CancelledAt)
+	}
+	if !strings.HasPrefix((*r.log)[0], "cancel:") || (*r.log)[0] != (*r.log)[1] {
+		t.Fatalf("calls %v: the cancellation must be asked twice with the same key", *r.log)
+	}
+}
+
+func TestA_an_unclear_void_or_list_is_asked_again_and_gives_up_after_fifteen_minutes(t *testing.T) {
+	for name, tc := range map[string]struct {
+		set  func(r *rig)
+		step saga.Step
+	}{
+		"void": {func(r *rig) { r.res.voidErr = errors.New("timeout") }, saga.VoidProposals},
+		"list": {func(r *rig) { r.res.listErr = errors.New("timeout") }, saga.OpenEpisodes},
+	} {
+		r := newRig()
+		tc.set(r)
+		s, _, err := r.uc.Start(context.Background(), cmd("key-0000001"))
+		if err != nil || s.Status != saga.Running || len(r.res.opens) != 0 {
+			t.Fatalf("%s: status %s, episodes %d, err %v", name, s.Status, len(r.res.opens), err)
+		}
+		r.stale(s.ID, 20*time.Minute)
+		r.resume()
+		got := r.store.byID[s.ID]
+		if got.Status != saga.Failed || got.FailedStep != tc.step || got.Reason != saga.ParticipantUnavailable {
+			t.Fatalf("%s: status %s, failed step %s, reason %s", name, got.Status, got.FailedStep, got.Reason)
+		}
+		if len(r.res.opens) != 0 {
+			t.Fatalf("%s: an episode was opened without a list or after the proposals failed", name)
+		}
+	}
+}
+
+// A reservation refused for good is not asked again; one that was unclear is, and the saga stays running until it ends.
+func TestA_failed_and_pending_reservations_keep_the_saga_running_and_only_the_pending_are_asked_again(t *testing.T) {
+	r := newRig()
+	r.res.ids = []string{rid(1), rid(2), rid(3)}
+	r.res.open = func(_ int, c openCall) error {
+		switch c.Reservation {
+		case rid(1):
+			return out.ErrRefused
+		case rid(2):
+			return errors.New("timeout")
+		}
+		return nil
+	}
+	first, _, err := r.uc.Start(context.Background(), cmd("key-0000001"))
+	if err != nil || first.Status != saga.Running {
+		t.Fatalf("status %s, err %v: a pending reservation keeps the saga running", first.Status, err)
+	}
+	r.stale(first.ID, time.Hour)
+	r.res.open = func(int, openCall) error { return nil }
+	before := len(r.res.opens)
+	r.resume()
+	asked := r.res.opens[before:]
+	if len(asked) != 1 || asked[0].Reservation != rid(2) {
+		t.Fatalf("asked again %+v: only the pending reservation", asked)
+	}
+	got := r.store.byID[first.ID]
+	if got.Status != saga.Failed || got.Reason != saga.ReservationsFailed || len(got.Left()) != 1 || got.Left()[0] != rid(1) {
+		t.Fatalf("status %s, reason %s, left %v: it ends FAILED naming the one refused", got.Status, got.Reason, got.Left())
+	}
+}
+
+func TestA_a_list_that_is_not_found_ends_failed_and_opens_nothing(t *testing.T) {
+	r := newRig()
+	r.res.listErr = out.ErrNotFound
+	s, _, err := r.uc.Start(context.Background(), cmd("key-0000001"))
+	if err != nil || s.Status != saga.Failed || s.FailedStep != saga.OpenEpisodes || len(r.res.opens) != 0 {
+		t.Fatalf("status %s, failed step %s, episodes %d, err %v", s.Status, s.FailedStep, len(r.res.opens), err)
+	}
+}
+
+// What a participant answers goes into the state and into paths: an id that is not an id, or an instant that is not one, is not a yes.
+func TestA_a_cancellation_without_a_usable_departure_id_or_instant_is_unclear(t *testing.T) {
+	for name, answer := range map[string]out.Cancellation{
+		"no id":      {CancelledAt: cancelledAt},
+		"not an id":  {DepartureID: "SAL-013", CancelledAt: cancelledAt},
+		"no instant": {DepartureID: departure},
+	} {
+		r := newRig()
+		r.ops.answer = func(int) (out.Cancellation, error) { return answer, nil }
+		s, _, err := r.uc.Start(context.Background(), cmd("key-0000001"))
+		if err != nil || s.Status != saga.Running || len(s.Steps) != 0 || len(*r.log) != 1 || r.store.saves != 0 {
+			t.Fatalf("%s: status %s, steps %s, calls %v, saves %d, err %v", name, s.Status, steps(s), *r.log, r.store.saves, err)
+		}
+	}
+}
+
+func TestA_a_list_with_an_invalid_id_is_unclear_and_a_repeated_id_is_listed_once(t *testing.T) {
+	r := newRig()
+	r.res.ids = []string{rid(1), "not-an-id"}
+	s, _, err := r.uc.Start(context.Background(), cmd("key-0000001"))
+	if err != nil || s.Status != saga.Running || len(r.res.opens) != 0 || len(s.Reservations) != 0 {
+		t.Fatalf("status %s, episodes %d, reservations %v, err %v: an invalid id is not saved", s.Status, len(r.res.opens), s.Reservations, err)
+	}
+	r = newRig()
+	r.res.ids = []string{rid(1), rid(2), rid(1)}
+	s, _, _ = r.uc.Start(context.Background(), cmd("key-0000001"))
+	if len(s.Reservations) != 2 || len(r.res.opens) != 2 {
+		t.Fatalf("reservations %v, episodes %d: a repeated id is one reservation", s.Reservations, len(r.res.opens))
 	}
 }

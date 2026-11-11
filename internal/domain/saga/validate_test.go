@@ -37,7 +37,7 @@ func TestD_an_id_is_a_uuid_in_either_case_and_nothing_else(t *testing.T) {
 
 // The answer of the saga names the reservations that are not handled: the ones that failed and the ones still pending, never the opened.
 func TestD_left_names_the_reservations_that_are_not_opened(t *testing.T) {
-	s := saga.Saga{Reservations: []saga.Reservation{{ID: "a", State: saga.Opened}, {ID: "b", State: saga.Failed}, {ID: "c", State: saga.Pending}}}
+	s := saga.Saga{Reservations: []saga.Reservation{{ID: "a", State: saga.Opened}, {ID: "b", State: saga.EpisodeFailed}, {ID: "c", State: saga.Pending}}}
 	if left := s.Left(); len(left) != 2 || left[0] != "b" || left[1] != "c" {
 		t.Fatalf("left %v, want b and c", left)
 	}
