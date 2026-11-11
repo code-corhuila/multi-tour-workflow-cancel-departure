@@ -100,7 +100,7 @@ func (s Saga) Handled() int {
 	return n
 }
 
-// Left are the ids of the reservations whose episode is not open (failed or still pending), in the order they were listed.
+// Left are the ids of the reservations whose episode is not open (failed or still pending), in the order of the list the saga holds (the store gives them by id).
 func (s Saga) Left() []string {
 	var left []string
 	for _, r := range s.Reservations {
