@@ -16,6 +16,9 @@ import (
 
 const (
 	resumeBatch = 50
+	// defaultResumeBudget is what a resumed saga may take before it is left for the next pass: one slow saga does not eat the whole pass. It is
+	// shorter than the time a saga may stand still before it is taken, so a saga that is being run is never taken.
+	defaultResumeBudget = 60 * time.Second
 	// giveUpAfter is how long a saga may stay RUNNING because a participant gave no clear answer; then it ends FAILED for a person.
 	giveUpAfter = 15 * time.Minute
 )
@@ -27,13 +30,20 @@ type CancelDeparture struct {
 	store        out.Store
 	clock        func() time.Time
 	log          *slog.Logger
+	resumeBudget time.Duration
 }
 
 var _ in.CancelDeparture = (*CancelDeparture)(nil)
 
 // NewCancelDeparture returns the orchestrator over its participants and its store.
 func NewCancelDeparture(o out.Operations, r out.Reservations, st out.Store, clock func() time.Time, log *slog.Logger) *CancelDeparture {
-	return &CancelDeparture{operations: o, reservations: r, store: st, clock: clock, log: log}
+	return &CancelDeparture{operations: o, reservations: r, store: st, clock: clock, log: log, resumeBudget: defaultResumeBudget}
+}
+
+// WithResumeBudget sets what each resumed saga may take; the default is a minute.
+func (c *CancelDeparture) WithResumeBudget(d time.Duration) *CancelDeparture {
+	c.resumeBudget = d
+	return c
 }
 
 // Start creates the saga, or returns the one that has the same tenant and key without running anything, and runs it to its end.
@@ -43,7 +53,17 @@ func (c *CancelDeparture) Start(ctx context.Context, cmd in.StartCommand) (saga.
 	if err != nil || !created {
 		return s, false, err
 	}
+	id := s.ID
 	s, err = c.run(ctx, s)
+	if err != nil && ctx.Err() != nil {
+		// the budget of the request ended before an answer could be saved: the saga exists and goes on in the resumption, so it is answered as it
+		// is stored and not with an error that would hide it
+		fresh, cancel := context.WithTimeout(context.WithoutCancel(ctx), 5*time.Second)
+		defer cancel()
+		if stored, getErr := c.store.Get(fresh, cmd.TenantID, id); getErr == nil {
+			return stored, true, nil
+		}
+	}
 	return s, true, err
 }
 
@@ -71,7 +91,10 @@ func (c *CancelDeparture) Resume(ctx context.Context, before time.Time) (int, er
 			continue
 		}
 		resumed++
-		if _, err := c.run(ctx, claimed); err != nil {
+		runCtx, stop := context.WithTimeout(ctx, c.resumeBudget)
+		_, err = c.run(runCtx, claimed)
+		stop()
+		if err != nil {
 			c.log.ErrorContext(ctx, "resumed saga did not end well", "sagaId", claimed.ID, "error", err.Error())
 		}
 	}
@@ -167,6 +190,9 @@ func (c *CancelDeparture) openEpisodes(ctx context.Context, s saga.Saga) (saga.S
 		s = saved
 	}
 	for i := range s.Reservations {
+		if ctx.Err() != nil {
+			break // the budget is over: the reservations that are left stay pending and are asked in the next pass
+		}
 		if s.Reservations[i].State != saga.Pending {
 			continue
 		}
@@ -219,7 +245,7 @@ func (c *CancelDeparture) finish(ctx context.Context, s saga.Saga) (saga.Saga, e
 // participant repeats safely; after giveUpAfter it ends FAILED for a person. On an error the saga returned is the one the caller had.
 func (c *CancelDeparture) unclear(ctx context.Context, s saga.Saga, step saga.Step, cause error) (saga.Saga, error) {
 	c.log.WarnContext(ctx, "a participant gave no clear answer", "sagaId", s.ID, "step", string(step), "error", cause.Error())
-	if c.clock().Sub(s.CreatedAt) >= giveUpAfter {
+	if ctx.Err() == nil && c.clock().Sub(s.CreatedAt) >= giveUpAfter {
 		return c.end(ctx, s, saga.Failed, step, saga.ParticipantUnavailable)
 	}
 	return s, nil
