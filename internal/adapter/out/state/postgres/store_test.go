@@ -143,7 +143,7 @@ func TestI_a_saga_with_a_pending_reservation_cannot_be_completed(t *testing.T) {
 	s, _ = store.Save(ctx, afterStepOne(s))
 	s.Reservations[0].State = saga.Opened // the second stays PENDING
 	s.End(saga.Completed, "", "", now)
-	if _, err := store.Save(ctx, s); !errors.Is(err, postgres.ErrPendingReservations) {
+	if _, err := store.Save(ctx, s); !errors.Is(err, out.ErrPendingReservations) {
 		t.Fatalf("err %v, want ErrPendingReservations", err)
 	}
 	got, _ := store.Get(ctx, tenant, s.ID)
@@ -251,7 +251,7 @@ func TestI_open_names_the_kind_of_failure_and_never_the_connection_string(t *tes
 			t.Fatalf("the error leaks %q: %v", leaked, err)
 		}
 	}
-	if _, err := postgres.Open(context.Background(), "::not a url::", postgres.Limits{}); err == nil || strings.Contains(err.Error(), "::not") {
+	if _, err := postgres.Open(context.Background(), "postgres://workflow_user:s3cret-pass@[::1/db", postgres.Limits{MaxConns: 2, ConnectTimeout: time.Second, StatementTimeout: time.Second}); err == nil || strings.Contains(err.Error(), "s3cret-pass") {
 		t.Fatalf("a bad url: %v", err)
 	}
 }
@@ -264,5 +264,153 @@ func TestI_open_refuses_limits_that_are_not_positive(t *testing.T) {
 		if _, err := postgres.Open(context.Background(), url, limits); err == nil || !strings.Contains(err.Error(), "limits") {
 			t.Fatalf("limits %+v: err %v, want a refusal that names the limits", limits, err)
 		}
+	}
+}
+
+// A copy of the saga that is not the stored one writes nothing: no step, no reservation, not even a changed instant.
+func TestI_a_stale_copy_with_other_steps_and_reservations_writes_nothing(t *testing.T) {
+	store := postgres.NewStore(pgtest.Open(t))
+	ctx := context.Background()
+	s, _, _ := store.Create(ctx, newSaga(tenant, "key-0000001"))
+	older := s
+	s, _ = store.Save(ctx, afterStepOne(s))
+
+	older.DepartureID, older.CancelledAt = departure, cancelledAt
+	older.Done(saga.CancelDeparture, now)
+	older.Reservations = []saga.Reservation{{ID: rid("9"), State: saga.Opened}}
+	if _, err := store.Save(ctx, older); !errors.Is(err, out.ErrStale) {
+		t.Fatalf("err %v, want ErrStale", err)
+	}
+	got, _ := store.Get(ctx, tenant, s.ID)
+	if len(got.Steps) != 2 || len(got.Reservations) != 2 || got.Version != 1 {
+		t.Fatalf("stored %+v: the stale copy changed something", got)
+	}
+}
+
+// A saga is completed when every reservation is open; one refused for good is not pending, so the store lets the use case end it FAILED.
+func TestI_a_saga_with_every_reservation_open_is_completed(t *testing.T) {
+	store := postgres.NewStore(pgtest.Open(t))
+	ctx := context.Background()
+	s, _, _ := store.Create(ctx, newSaga(tenant, "key-0000001"))
+	s, _ = store.Save(ctx, afterStepOne(s))
+	s.Reservations[0].State, s.Reservations[1].State = saga.Opened, saga.Opened
+	s.Done(saga.OpenEpisodes, now)
+	s.End(saga.Completed, "", "", now)
+	if _, err := store.Save(ctx, s); err != nil {
+		t.Fatalf("err %v", err)
+	}
+	if got, _ := store.Get(ctx, tenant, s.ID); got.Status != saga.Completed || got.Handled() != 2 {
+		t.Fatalf("stored %+v", got)
+	}
+}
+
+// OPENED and FAILED are final (plan D-06): a copy with the right version that sends a reservation back to PENDING is refused and nothing is saved.
+func TestI_a_reservation_that_is_opened_or_failed_does_not_go_back(t *testing.T) {
+	for _, final := range []saga.ReservationState{saga.Opened, saga.EpisodeFailed} {
+		store := postgres.NewStore(pgtest.Open(t))
+		ctx := context.Background()
+		s, _, _ := store.Create(ctx, newSaga(tenant, "key-0000001"))
+		s, _ = store.Save(ctx, afterStepOne(s))
+		s.Reservations[0].State = final
+		s, err := store.Save(ctx, s)
+		if err != nil {
+			t.Fatal(err)
+		}
+		s.Reservations[0].State = saga.Pending
+		s.Reservations[1].State = saga.Opened
+		if _, err := store.Save(ctx, s); !errors.Is(err, out.ErrStale) {
+			t.Fatalf("%s: err %v, want a refusal", final, err)
+		}
+		got, _ := store.Get(ctx, tenant, s.ID)
+		if got.Reservations[0].State != final || got.Reservations[1].State != saga.Pending || got.Version != 2 {
+			t.Fatalf("%s: stored %+v: the refused save changed something", final, got)
+		}
+	}
+}
+
+// The steps only grow, and the departure id with the instant of the cancellation are written once: a later copy cannot take them away or change them,
+// because a resumption must send the same instant.
+func TestI_the_steps_only_grow_and_the_departure_id_and_the_instant_never_change(t *testing.T) {
+	store := postgres.NewStore(pgtest.Open(t))
+	ctx := context.Background()
+	s, _, _ := store.Create(ctx, newSaga(tenant, "key-0000001"))
+	s, _ = store.Save(ctx, afterStepOne(s))
+
+	fewer := s
+	fewer.Steps = fewer.Steps[:1]
+	if _, err := store.Save(ctx, fewer); !errors.Is(err, out.ErrStale) {
+		t.Fatalf("fewer steps: err %v, want a refusal", err)
+	}
+	changed := s
+	changed.CancelledAt = cancelledAt.Add(time.Hour)
+	if _, err := store.Save(ctx, changed); !errors.Is(err, out.ErrStale) {
+		t.Fatalf("another instant: err %v, want a refusal", err)
+	}
+	blank := s
+	blank.DepartureID, blank.CancelledAt = "", time.Time{}
+	saved, err := store.Save(ctx, blank)
+	if err != nil || saved.DepartureID != departure || !saved.CancelledAt.Equal(cancelledAt) {
+		t.Fatalf("a copy without them: saved %+v, err %v: the stored ones are kept and returned", saved, err)
+	}
+	got, _ := store.Get(ctx, tenant, s.ID)
+	if got.DepartureID != departure || !got.CancelledAt.Equal(cancelledAt) {
+		t.Fatalf("stored %+v", got)
+	}
+}
+
+// PostgreSQL keeps microseconds: what Save returns is what a resumption reads, in UTC, so the instant that goes to the participants is the same.
+func TestI_the_instant_of_the_cancellation_is_kept_to_the_microsecond_in_utc(t *testing.T) {
+	store := postgres.NewStore(pgtest.Open(t))
+	ctx := context.Background()
+	s, _, _ := store.Create(ctx, newSaga(tenant, "key-0000001"))
+	s = afterStepOne(s)
+	s.CancelledAt = time.Date(2026, 11, 11, 3, 50, 0, 123456789, time.FixedZone("COT", -5*3600))
+	saved, err := store.Save(ctx, s)
+	if err != nil {
+		t.Fatal(err)
+	}
+	got, _ := store.Get(ctx, tenant, s.ID)
+	if !got.CancelledAt.Equal(saved.CancelledAt) || got.CancelledAt.Location() != time.UTC || got.CancelledAt.Nanosecond() != 123456000 {
+		t.Fatalf("returned %v, read %v: want the same instant, truncated to the microsecond, in UTC", saved.CancelledAt, got.CancelledAt)
+	}
+}
+
+func TestI_a_save_with_an_unknown_or_bad_id_is_stale_and_a_bad_tenant_is_not_created(t *testing.T) {
+	store := postgres.NewStore(pgtest.Open(t))
+	ctx := context.Background()
+	for _, id := range []string{"not-an-id", "99999999-9999-4999-8999-999999999999"} {
+		s := newSaga(tenant, "key-0000001")
+		s.ID = id
+		if _, err := store.Save(ctx, s); !errors.Is(err, out.ErrStale) {
+			t.Fatalf("id %q: err %v, want ErrStale", id, err)
+		}
+	}
+	if _, _, err := store.Create(ctx, newSaga("not-a-tenant", "key-0000001")); err == nil || strings.Contains(err.Error(), "not-a-tenant") {
+		t.Fatalf("err %v: a tenant that is not an id is refused without quoting it", err)
+	}
+}
+
+// The listing hands out the steps and the reservations of each saga, each with its own.
+func TestI_the_listing_gives_each_saga_its_own_steps_and_reservations(t *testing.T) {
+	store := postgres.NewStore(pgtest.Open(t))
+	ctx := context.Background()
+	a, _, _ := store.Create(ctx, saga.New(tenant, "key-0000001", "SAL-001", now.Add(-2*time.Hour)))
+	b, _, _ := store.Create(ctx, saga.New(tenant, "key-0000002", "SAL-002", now.Add(-time.Hour)))
+	a = afterStepOne(a)
+	a.UpdatedAt = now.Add(-2 * time.Hour)
+	b.DepartureID, b.CancelledAt = departure, cancelledAt
+	b.Done(saga.CancelDeparture, now)
+	b.UpdatedAt = now.Add(-time.Hour)
+	b.Reservations = []saga.Reservation{{ID: rid("3"), State: saga.Pending}}
+	if _, err := store.Save(ctx, a); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.Save(ctx, b); err != nil {
+		t.Fatal(err)
+	}
+	stale, err := store.ListStale(ctx, now, 10)
+	if err != nil || len(stale) != 2 || len(stale[0].Steps) != 2 || len(stale[0].Reservations) != 2 || len(stale[1].Steps) != 1 ||
+		len(stale[1].Reservations) != 1 || stale[1].Reservations[0].ID != rid("3") {
+		t.Fatalf("stale %+v, err %v", stale, err)
 	}
 }
