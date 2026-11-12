@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"net/http"
 	"net/url"
+	"regexp"
 	"strconv"
 	"strings"
 	"time"
@@ -30,6 +31,7 @@ const (
 	// one pass of the resumption over the sagas left running
 	resumePass = 5 * time.Minute
 
+	defaultStarters = "worker-departure-deadlines"
 	defaultIssuer   = "multi-tour-security"
 	defaultAudience = "multi-tour"
 )
@@ -45,6 +47,8 @@ type config struct {
 	databaseURL            string
 	stepTimeout            time.Duration
 	stepAttempts           int
+	// starters are the subjects of the service tokens that may start the saga through the internal route (plan D-11)
+	starters []string
 }
 
 // loadConfig reads the variables of .env.example. Every refusal names the variable and never its value: the token and the connection
@@ -64,6 +68,11 @@ func loadConfig(getenv func(string) string) (config, error) {
 		stepAttempts:    defaultStepAttempts,
 	}
 	var problems []error
+	if starters, ok := parseStarters(valueOr(getenv("CANCEL_DEPARTURE_STARTERS"), defaultStarters)); ok {
+		cfg.starters = starters
+	} else {
+		problems = append(problems, errors.New("CANCEL_DEPARTURE_STARTERS must be a comma separated list of service names"))
+	}
 	refuse := func(name, why string) { problems = append(problems, fmt.Errorf("%s %s", name, why)) }
 
 	for _, check := range []struct{ name, value string }{{"COMMERCIAL_RESERVATION_BASE_URL", cfg.reservationsURL}, {"OPERATIONS_COST_BASE_URL", cfg.operationsURL}} {
@@ -131,4 +140,20 @@ func (b budgeted) Start(ctx context.Context, cmd in.StartCommand) (saga.Saga, bo
 	ctx, cancel := context.WithTimeout(ctx, startBudget)
 	defer cancel()
 	return b.CancelDeparture.Start(ctx, cmd)
+}
+
+// starterName is a service name as `issue-service-token <name>` of the security service takes it: lower case, digits and dashes.
+var starterName = regexp.MustCompile(`^[a-z0-9][a-z0-9-]{0,63}$`)
+
+// parseStarters reads a comma separated list; an empty item or a name that is not a service name refuses the whole list.
+func parseStarters(raw string) ([]string, bool) {
+	var starters []string
+	for _, name := range strings.Split(raw, ",") {
+		name = strings.TrimSpace(name)
+		if !starterName.MatchString(name) {
+			return nil, false
+		}
+		starters = append(starters, name)
+	}
+	return starters, true
 }
