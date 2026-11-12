@@ -185,3 +185,24 @@ func TestC_the_budget_keeps_a_shorter_deadline_and_follows_the_cancellation_of_t
 		t.Fatal("the start did not follow the cancellation of its request")
 	}
 }
+
+// Plan D-11: who may start the saga through the internal route is a list in the environment; job 3 by default.
+func TestU_the_starters_of_the_internal_route_default_to_job_3_and_are_read_from_the_environment(t *testing.T) {
+	cfg, err := loadConfig(env(nil))
+	if err != nil || strings.Join(cfg.starters, ",") != "worker-departure-deadlines" {
+		t.Fatalf("default starters %v, %v", cfg.starters, err)
+	}
+	cfg, err = loadConfig(env(map[string]string{"CANCEL_DEPARTURE_STARTERS": " worker-departure-deadlines , worker-other "}))
+	if err != nil || strings.Join(cfg.starters, ",") != "worker-departure-deadlines,worker-other" {
+		t.Fatalf("listed starters %v, %v", cfg.starters, err)
+	}
+}
+
+func TestU_a_malformed_list_of_starters_stops_the_start_naming_the_variable(t *testing.T) {
+	for name, value := range map[string]string{"an empty item": "worker-a,,worker-b", "only commas": ",", "a bad character": "worker a", "a path": "../x"} {
+		_, err := loadConfig(env(map[string]string{"CANCEL_DEPARTURE_STARTERS": value}))
+		if err == nil || !strings.Contains(err.Error(), "CANCEL_DEPARTURE_STARTERS") {
+			t.Errorf("%s: error %v, want it to name the variable", name, err)
+		}
+	}
+}

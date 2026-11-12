@@ -109,7 +109,7 @@ func completed() saga.Saga {
 }
 
 func newHandler(uc in.CancelDeparture, logs *bytes.Buffer) http.Handler {
-	return httpapi.New(uc, httpapi.NewVerifier(&signer.PublicKey, issuer, audience), slog.New(slog.NewJSONHandler(logs, nil)))
+	return httpapi.New(uc, httpapi.NewVerifier(&signer.PublicKey, issuer, audience), slog.New(slog.NewJSONHandler(logs, nil)), []string{"worker-departure-deadlines"})
 }
 
 type call struct {
@@ -573,5 +573,39 @@ func TestC_a_null_or_empty_body_is_refused(t *testing.T) {
 		if rec := post(t, body).send(newHandler(uc, &bytes.Buffer{})); rec.Code != http.StatusBadRequest || uc.startCtx != nil {
 			t.Errorf("%q: status %d, started %v", body, rec.Code, uc.startCtx != nil)
 		}
+	}
+}
+
+// Plan D-11, AC-WF4-01.12: cancelling a departure cannot be undone, so the internal route lets in only the services named as starters; any other
+// service token, a customer or a person is refused with 403 and nothing starts.
+func TestC_only_a_listed_service_starts_the_saga_through_the_internal_route(t *testing.T) {
+	cases := map[string]struct {
+		claims jwt.MapClaims
+		status int
+	}{
+		"job 3":                  {service(nil), http.StatusCreated},
+		"another service":        {service(func(c jwt.MapClaims) { c["sub"] = "worker-retention" }), http.StatusForbidden},
+		"a similar name":         {service(func(c jwt.MapClaims) { c["sub"] = "worker-departure-deadlines-2" }), http.StatusForbidden},
+		"the saga of the others": {service(func(c jwt.MapClaims) { c["sub"] = "workflow-change-departure-vehicles" }), http.StatusForbidden},
+	}
+	for name, tc := range cases {
+		c := postInternal(t, goodBody)
+		c.bearer = token(t, signer, tc.claims)
+		uc := &fakeUseCase{started: completed(), created: true}
+		rec := c.send(newHandler(uc, &bytes.Buffer{}))
+		if rec.Code != tc.status || (tc.status == http.StatusForbidden && uc.startCtx != nil) {
+			t.Errorf("%s: status %d (want %d), started %v", name, rec.Code, tc.status, uc.startCtx != nil)
+		}
+	}
+}
+
+// With no starter listed no service may start it: the list is the only way in.
+func TestC_with_no_starter_listed_no_service_starts_the_saga(t *testing.T) {
+	h := httpapi.New(&fakeUseCase{started: completed(), created: true}, httpapi.NewVerifier(&signer.PublicKey, issuer, audience),
+		slog.New(slog.NewJSONHandler(&bytes.Buffer{}, nil)), nil)
+	c := postInternal(t, goodBody)
+	c.bearer = token(t, signer, service(nil))
+	if rec := c.send(h); rec.Code != http.StatusForbidden {
+		t.Errorf("status %d, want 403", rec.Code)
 	}
 }
