@@ -80,7 +80,7 @@ paths:
     post:
       summary: Cancel a departure of a tenant, for job 3
       description: >
-        For the SERVICE role only (job 3, when the tenant is inactive at the start time of a departure); the token of a person is a
+        For a service token whose subject is a listed starter (CANCEL_DEPARTURE_STARTERS, job 3 by default: worker-departure-deadlines, when the tenant is inactive at the start time of a departure); the token of a person is a
         403. The tenant is the one of the path, and it may be inactive. The gateway never routes it. The rest is as for the
         route of the Tenant Administrator.
       operationId: startCancelDepartureForTenant
