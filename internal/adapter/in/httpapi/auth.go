@@ -2,8 +2,11 @@ package httpapi
 
 import (
 	"crypto/rsa"
+	"crypto/x509"
+	"encoding/pem"
 	"errors"
 	"slices"
+	"strings"
 
 	"time"
 
@@ -15,6 +18,7 @@ import (
 const (
 	// tokenLeeway is the clock tolerance of ADR-004 D10.
 	tokenLeeway         = 30 * time.Second
+	minKeyBits          = 2048
 	tenantAdministrator = "TENANT_ADMINISTRATOR"
 	serviceRole         = "SERVICE"
 )
@@ -99,4 +103,27 @@ func (v *Verifier) Verify(raw string) (Claims, error) {
 // tenant of its route is the one of the path.
 func (c Claims) isService() bool {
 	return c.Access == "" && c.TenantID == "" && slices.Equal(c.Roles, []string{serviceRole})
+}
+
+// ParsePublicKey reads the RSA public key of the security service from PEM (PKIX or PKCS#1).
+func ParsePublicKey(data []byte) (*rsa.PublicKey, error) {
+	block, _ := pem.Decode(data)
+	if block == nil {
+		return nil, errors.New("the public key is not PEM")
+	}
+	var key any
+	var err error
+	if strings.Contains(block.Type, "RSA") {
+		key, err = x509.ParsePKCS1PublicKey(block.Bytes)
+	} else {
+		key, err = x509.ParsePKIXPublicKey(block.Bytes)
+	}
+	if err != nil {
+		return nil, errors.New("the public key cannot be read")
+	}
+	rsaKey, ok := key.(*rsa.PublicKey)
+	if !ok || rsaKey.N.BitLen() < minKeyBits {
+		return nil, errors.New("the public key must be RSA of at least 2048 bits")
+	}
+	return rsaKey, nil
 }
