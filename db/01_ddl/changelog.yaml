@@ -1,0 +1,13 @@
+databaseChangeLog:
+  - include:
+      file: 01_schemas/changelog.yaml
+      relativeToChangelogFile: true
+  - include:
+      file: 03_tables/changelog.yaml
+      relativeToChangelogFile: true
+  - include:
+      file: 04_alter/changelog.yaml
+      relativeToChangelogFile: true
+  - include:
+      file: 10_indexes/changelog.yaml
+      relativeToChangelogFile: true
