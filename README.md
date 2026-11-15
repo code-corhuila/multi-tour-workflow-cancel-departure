@@ -11,19 +11,19 @@ The saga that cancels a departure and handles its reservations (ADR-004 D3, stor
 
 ## How to start it
 
-Not built yet: this repository holds the skeleton and the contract of its routes (`openapi/openapi.yaml`). The image, the composition and the instructions to run it come with their tasks (WF4-06 of the spec in `multi-tour-docs`).
+Run the migrator once per environment (see `deploy/compose.yml`), then `docker compose -f deploy/compose.yml up workflow-cancel-departure`, with the variables of `.env.example` (the compose file maps the secrets from `env/<environment>.env` of `multi-tour-infra-postgres`) and the `SERVICE_TOKEN` issued by the security service. The service listens on 8090 inside the platform network, under the name `multi-tour-workflow-cancel-departure`, and publishes no port. Entry through the gateway: `POST /api/v1/sagas/cancel-departure` and `GET /api/v1/sagas/cancel-departure/{id}` (see `openapi/openapi.yaml`); job 3 calls the internal route directly, which the gateway never routes. The request that starts a saga has a budget of 60 seconds: what is not done by then is saved as `RUNNING` and goes on in the resumption, which takes every minute the sagas that have not moved for two minutes.
 
 ## Where the data is
 
-In PostgreSQL, schema `workflow_cancel_departure` of the single instance (ADR-005 E4); its migrations will be in `db/`, with the control table `databasechangelog_workflow_cancel_departure`.
+In PostgreSQL, schema `workflow_cancel_departure` of the single instance (ADR-005 E4); its migrations are in `db/`, with the control table `databasechangelog_workflow_cancel_departure`.
 
 ## How to test it
 
-`gofmt -l .` must print nothing, then `go vet ./...` and `go test ./...` (Go 1.26). The tests of the store will need `TEST_DATABASE_URL` and will be skipped without it; the CI sets it.
+`gofmt -l .` must print nothing, then `go vet ./...` and `go test ./...` (Go 1.26). The tests of the store need `TEST_DATABASE_URL` (a PostgreSQL where the test can create databases) and are skipped without it; the CI sets it. `sh db/tests/db-ci.sh` builds the schema from an empty PostgreSQL, reruns it, rolls it back and rebuilds it (Docker is the only requirement). The same checks, and the build of the image, run in `ci.yml` on pull requests to `develop` and `qa`.
 
 ## What is missing
 
-Everything but the skeleton and the contract. The routes the saga calls do not exist yet either: the cancellation of a departure in `operations-cost`, and the list of the reservations of a departure for a service and the two routes of the episodes in `commercial-reservation` (plan D-02 of the spec in `multi-tour-docs`).
+The routes that the saga calls do not exist yet: the cancellation of a departure in `operations-cost`, and the list of the reservations of a departure for a service in `commercial-reservation` (plan D-02 of the spec in `multi-tour-docs`); the two routes of the episodes are in its contract. The saga is tested against doubles that follow them, and has not been run end to end. The route of the saga in the gateway for the internal start and the include in the root composition belong to the shared repositories.
 
 ## Branching
 
