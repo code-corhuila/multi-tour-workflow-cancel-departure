@@ -40,7 +40,10 @@ type fakeOperations struct {
 	answer  func(n int) (out.Cancellation, error)
 }
 
-func (f *fakeOperations) CancelDeparture(_ context.Context, tenantID, departureCode, key string) (out.Cancellation, error) {
+func (f *fakeOperations) CancelDeparture(ctx context.Context, tenantID, departureCode, key string) (out.Cancellation, error) {
+	if ctx.Err() != nil {
+		return out.Cancellation{}, ctx.Err()
+	}
 	f.cancels++
 	*f.log = append(*f.log, "cancel:"+tenantID+"/"+departureCode+"/"+key)
 	if f.answer != nil {
@@ -70,26 +73,41 @@ type fakeReservations struct {
 	voidErr error
 	voids   []voidCall
 	opens   []openCall
+	// block makes every call to open an episode wait until its context ends, like a participant that does not answer
+	block bool
 	// open decides each call to open an episode by its position (0 is the first)
 	open func(n int, c openCall) error
 }
 
-func (f *fakeReservations) ListAffected(_ context.Context, tenantID, departureID string) ([]string, error) {
+func (f *fakeReservations) ListAffected(ctx context.Context, tenantID, departureID string) ([]string, error) {
+	if ctx.Err() != nil {
+		return nil, ctx.Err()
+	}
 	f.lists++
 	*f.log = append(*f.log, "list")
 	return f.ids, f.listErr
 }
 
-func (f *fakeReservations) VoidProposals(_ context.Context, tenantID, departureID string, at time.Time, key string) error {
+func (f *fakeReservations) VoidProposals(ctx context.Context, tenantID, departureID string, at time.Time, key string) error {
+	if ctx.Err() != nil {
+		return ctx.Err()
+	}
 	f.voids = append(f.voids, voidCall{tenantID, departureID, at, key})
 	*f.log = append(*f.log, "void")
 	return f.voidErr
 }
 
-func (f *fakeReservations) OpenEpisode(_ context.Context, tenantID, reservationID, departureID string, at time.Time, key string) error {
+func (f *fakeReservations) OpenEpisode(ctx context.Context, tenantID, reservationID, departureID string, at time.Time, key string) error {
 	c := openCall{tenantID, reservationID, departureID, at, key}
 	f.opens = append(f.opens, c)
 	*f.log = append(*f.log, "open:"+reservationID)
+	if f.block {
+		<-ctx.Done()
+		return ctx.Err()
+	}
+	if ctx.Err() != nil {
+		return ctx.Err()
+	}
 	if f.open == nil {
 		return nil
 	}
@@ -127,7 +145,10 @@ func (m *memStore) Create(_ context.Context, s saga.Saga) (saga.Saga, bool, erro
 	return copyOf(s), true, nil
 }
 
-func (m *memStore) Save(_ context.Context, s saga.Saga) (saga.Saga, error) {
+func (m *memStore) Save(ctx context.Context, s saga.Saga) (saga.Saga, error) {
+	if ctx.Err() != nil {
+		return saga.Saga{}, ctx.Err()
+	}
 	m.attempts++
 	if m.attempts == m.failSave || m.byID[s.ID].Version != s.Version {
 		return saga.Saga{}, out.ErrStale
@@ -678,5 +699,92 @@ func TestA_a_list_with_an_invalid_id_is_unclear_and_a_repeated_id_is_listed_once
 	s, _, _ = r.uc.Start(context.Background(), cmd("key-0000001"))
 	if len(s.Reservations) != 2 || len(r.res.opens) != 2 {
 		t.Fatalf("reservations %v, episodes %d: a repeated id is one reservation", s.Reservations, len(r.res.opens))
+	}
+}
+
+// A request whose budget ends in the middle of a call is not a refusal: the saga stays RUNNING as it was last saved, and the resumption goes on.
+func TestA_a_context_that_ends_in_the_cancellation_leaves_the_saga_running_as_it_was(t *testing.T) {
+	r := newRig()
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	s, created, err := r.uc.Start(ctx, cmd("key-0000001"))
+	if err != nil || !created || s.Status != saga.Running || len(s.Steps) != 0 || r.store.saves != 0 {
+		t.Fatalf("status %s, steps %s, saves %d, err %v: want RUNNING and nothing saved or ended", s.Status, steps(s), r.store.saves, err)
+	}
+}
+
+// The context ends after a call went well and before its answer could be saved: the saga exists and is RUNNING, so the start answers it as
+// such and not with an error; the resumption asks again with the same key.
+func TestA_a_context_that_ends_before_the_save_still_answers_the_saga_as_running(t *testing.T) {
+	r := newRig()
+	ctx, cancel := context.WithCancel(context.Background())
+	r.ops.answer = func(int) (out.Cancellation, error) {
+		cancel() // the answer arrives, and the budget is over
+		return out.Cancellation{DepartureID: departure, CancelledAt: cancelledAt}, nil
+	}
+	s, created, err := r.uc.Start(ctx, cmd("key-0000001"))
+	if err != nil || !created || s.Status != saga.Running || s.ID == "" {
+		t.Fatalf("status %s, id %q, created %v, err %v: want the saga as it is stored", s.Status, s.ID, created, err)
+	}
+}
+
+// A saga that is old when its budget ends is not ended FAILED by the very context that ended: nothing could be saved, so nothing was decided.
+func TestA_an_old_saga_whose_context_ends_is_not_ended_failed(t *testing.T) {
+	r2 := newRig()
+	r2.res.ids = []string{rid(1)}
+	r2.res.open = func(int, openCall) error { return errors.New("down") }
+	s, _, _ := r2.uc.Start(context.Background(), cmd("key-0000002"))
+	r2.stale(s.ID, time.Hour)
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	r2.uc.Resume(ctx, now.Add(-2*time.Minute))
+	if got := r2.store.byID[s.ID]; got.Status != saga.Running {
+		t.Fatalf("status %s, want RUNNING", got.Status)
+	}
+}
+
+// With the context over, the reservations that are left are not asked one by one: the loop stops at the first.
+func TestA_a_context_that_ends_stops_the_loop_instead_of_asking_every_reservation(t *testing.T) {
+	r := newRig()
+	r.res.ids = []string{rid(1), rid(2), rid(3)}
+	ctx, cancel := context.WithCancel(context.Background())
+	r.res.open = func(n int, _ openCall) error {
+		if n == 0 {
+			cancel()
+			return ctx.Err()
+		}
+		return nil
+	}
+	s, _, err := r.uc.Start(ctx, cmd("key-0000001"))
+	if err != nil || s.Status != saga.Running || len(r.res.opens) != 1 {
+		t.Fatalf("status %s, episodes %d, err %v: want one call and RUNNING", s.Status, len(r.res.opens), err)
+	}
+}
+
+// One saga that is slow must not eat the whole pass: each resumed saga has its own budget, and the next one is attempted.
+
+// One saga whose participant never answers must not eat the whole pass: each resumed saga has its own budget, and the next one is attempted.
+func TestA_each_resumed_saga_has_its_own_budget_so_a_slow_one_does_not_starve_the_next(t *testing.T) {
+	r := newRig()
+	r.uc.WithResumeBudget(50 * time.Millisecond)
+	r.res.block = true
+	for _, key := range []string{"key-0000001", "key-0000002"} {
+		stopped := saga.New(tenant, key, code, now.Add(-time.Hour))
+		stopped.DepartureID, stopped.CancelledAt = departure, cancelledAt
+		stopped.Steps = []saga.Step{saga.CancelDeparture, saga.VoidProposals}
+		stopped.Reservations = []saga.Reservation{{ID: rid(1), State: saga.Pending}}
+		stored, _, _ := r.store.Create(context.Background(), stopped)
+		stored.UpdatedAt = now.Add(-time.Hour)
+		r.store.byID[stored.ID] = stored
+	}
+	done := make(chan int, 1)
+	go func() { n, _ := r.resume(); done <- n }()
+	select {
+	case resumed := <-done:
+		if resumed != 2 || len(r.res.opens) != 2 {
+			t.Fatalf("resumed %d, episodes asked %d: both sagas must be attempted", resumed, len(r.res.opens))
+		}
+	case <-time.After(3 * time.Second):
+		t.Fatal("the pass is still waiting on the first saga: a resumed saga has no budget of its own")
 	}
 }
