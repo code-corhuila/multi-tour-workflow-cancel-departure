@@ -1,6 +1,6 @@
 name: ci
 
-# gofmt, go vet and go test. Pull requests toward develop and qa only. No schedule.
+# gofmt, go vet, go test and db-ci. Pull requests toward develop and qa only. No schedule.
 on:
   pull_request:
     branches: [develop, qa]
@@ -41,3 +41,6 @@ jobs:
         run: go vet ./...
       - name: go test
         run: go test ./...
+      # Builds the saga schema from an empty PostgreSQL, reruns, rolls back and rebuilds (Annex A, db-ci)
+      - name: db-ci
+        run: sh db/tests/db-ci.sh

@@ -1,0 +1,18 @@
+databaseChangeLog:
+  - changeSet:
+      id: cancel-departure-dcl-grants-001
+      author: Molina211
+      labels: "HU-WFL-004,dcl,grants"
+      comment: "Grants on the schema and the writer role to the login user of the instance."
+      changes:
+        - sqlFile:
+            path: 001_grants.sql
+            relativeToChangelogFile: true
+            splitStatements: false
+            stripComments: false
+      rollback:
+        - sqlFile:
+            path: ../../05_rollbacks/03_dcl/01_grants/001_grants.rollback.sql
+            relativeToChangelogFile: true
+            splitStatements: false
+            stripComments: false
