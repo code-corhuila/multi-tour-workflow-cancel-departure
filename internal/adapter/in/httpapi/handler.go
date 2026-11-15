@@ -9,6 +9,7 @@ import (
 	"fmt"
 	"log/slog"
 	"net/http"
+	"slices"
 	"strings"
 	"time"
 	"unicode/utf8"
@@ -31,11 +32,14 @@ type handler struct {
 	uc       in.CancelDeparture
 	verifier *Verifier
 	log      *slog.Logger
+	// starters are the subjects of the service tokens that may start the saga through the internal route (plan D-11): cancelling a
+	// departure cannot be undone, so being the role SERVICE is not enough.
+	starters []string
 }
 
-// New returns the whole inbound side: the routes of the saga and /health.
-func New(uc in.CancelDeparture, verifier *Verifier, log *slog.Logger) http.Handler {
-	h := &handler{uc, verifier, log}
+// New returns the whole inbound side: the routes of the saga and /health. Only the services named in starters may use the internal route.
+func New(uc in.CancelDeparture, verifier *Verifier, log *slog.Logger, starters []string) http.Handler {
+	h := &handler{uc, verifier, log, starters}
 	mux := http.NewServeMux()
 	mux.HandleFunc(route, h.collection)
 	mux.HandleFunc(route+"/{id}", h.item)
@@ -113,14 +117,14 @@ func (h *handler) collection(w http.ResponseWriter, r *http.Request) {
 	h.start(w, r, claims.TenantID)
 }
 
-// internal is the start of job 3: the role SERVICE, and the tenant of the path, which may be inactive.
+// internal is the start of job 3: the role SERVICE with a subject listed as a starter, and the tenant of the path, which may be inactive.
 func (h *handler) internal(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodPost {
 		w.Header().Set("Allow", http.MethodPost)
 		writeError(w, r, http.StatusMethodNotAllowed, "METHOD_NOT_ALLOWED", "method not allowed")
 		return
 	}
-	if _, ok := h.authorize(w, r, Claims.isService, "a service"); !ok {
+	if _, ok := h.authorize(w, r, h.isStarter, "a service allowed to start it"); !ok {
 		return
 	}
 	tenantID := r.PathValue("tenantId")
@@ -234,4 +238,9 @@ func toResponse(s saga.Saga) sagaResponse {
 	}
 	return sagaResponse{ID: s.ID, Status: string(s.Status), DepartureCode: s.DepartureCode, CompletedSteps: steps, FailedStep: string(s.FailedStep),
 		Reason: string(s.Reason), HandledReservations: s.Handled(), ReservationsLeft: s.Left(), CreatedAt: s.CreatedAt.UTC(), UpdatedAt: s.UpdatedAt.UTC()}
+}
+
+// isStarter is true for a service token whose subject is one of the starters.
+func (h *handler) isStarter(c Claims) bool {
+	return c.isService() && slices.Contains(h.starters, c.Subject)
 }

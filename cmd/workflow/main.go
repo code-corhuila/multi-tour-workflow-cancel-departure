@@ -53,7 +53,7 @@ func run(log *slog.Logger) error {
 	cancel := usecase.NewCancelDeparture(participants.NewOperations(cfg.operationsURL, participantCfg),
 		participants.NewReservations(cfg.reservationsURL, participantCfg), postgres.NewStore(pool), time.Now, log)
 
-	srv := newServer(cfg, httpapi.New(budgeted{cancel}, httpapi.NewVerifier(key, cfg.jwtIssuer, cfg.jwtAudience), log))
+	srv := newServer(cfg, httpapi.New(budgeted{cancel}, httpapi.NewVerifier(key, cfg.jwtIssuer, cfg.jwtAudience), log, cfg.starters))
 	serving := make(chan error, 1)
 	go func() { serving <- srv.ListenAndServe() }()
 	log.Info("workflow listening", "addr", cfg.listenAddr)

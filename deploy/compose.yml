@@ -49,6 +49,7 @@ services:
       COMMERCIAL_RESERVATION_BASE_URL: ${COMMERCIAL_RESERVATION_BASE_URL:-http://multi-tour-commercial-reservation-api:8083}
       OPERATIONS_COST_BASE_URL: ${OPERATIONS_COST_BASE_URL:-http://multi-tour-operations-cost-api:8084}
       SERVICE_TOKEN: ${WORKFLOW_CANCEL_DEPARTURE_SERVICE_TOKEN:-}
+      CANCEL_DEPARTURE_STARTERS: ${CANCEL_DEPARTURE_STARTERS:-worker-departure-deadlines}
       JWT_PUBLIC_KEY_FILE: /run/secrets/jwt_public.pem
       JWT_ISSUER: ${JWT_ISSUER:-multi-tour-security}
       JWT_AUDIENCE: ${JWT_AUDIENCE:-multi-tour}
