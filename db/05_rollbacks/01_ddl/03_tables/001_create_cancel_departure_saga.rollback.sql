@@ -1,0 +1,3 @@
+DROP TABLE IF EXISTS workflow_cancel_departure.cancel_departure_saga_reservation;
+DROP TABLE IF EXISTS workflow_cancel_departure.cancel_departure_saga_step;
+DROP TABLE IF EXISTS workflow_cancel_departure.cancel_departure_saga;

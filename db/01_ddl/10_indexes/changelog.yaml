@@ -1,0 +1,18 @@
+databaseChangeLog:
+  - changeSet:
+      id: cancel-departure-ddl-indexes-001
+      author: Molina211
+      labels: "HU-WFL-004,ddl,indexes"
+      comment: "Serves the resumption loop that looks for RUNNING sagas that stopped advancing (plan D-06)."
+      changes:
+        - sqlFile:
+            path: 001_create_saga_indexes.sql
+            relativeToChangelogFile: true
+            splitStatements: false
+            stripComments: false
+      rollback:
+        - sqlFile:
+            path: ../../05_rollbacks/01_ddl/10_indexes/001_create_saga_indexes.rollback.sql
+            relativeToChangelogFile: true
+            splitStatements: false
+            stripComments: false
