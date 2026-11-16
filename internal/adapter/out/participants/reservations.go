@@ -29,7 +29,14 @@ func NewReservations(baseURL string, cfg Config) *Reservations {
 	return &Reservations{newClient(baseURL, cfg)}
 }
 
-// ListAffected reads every page of the reservations that hold seats on the departure and returns their ids. The saga decides on this list, so
+// holdsASeat says which statuses of the contract keep a seat of a departure that is still Programada: the others (cancelled, in execution, finished) have
+// none to release, and an episode of rescheduling is opened only for the ones that do.
+var holdsASeat = map[string]bool{"PENDING_PAYMENT": true, "CONFIRMED": true}
+
+// knownStatus are all the values of ReservationStatus in the contract; a row with another one is not understood and is not a yes.
+var knownStatus = map[string]bool{"PENDING_PAYMENT": true, "CONFIRMED": true, "IN_EXECUTION": true, "COMPLETED": true, "CANCELLED": true}
+
+// ListAffected reads every page of the reservations of the departure and returns the ids of the ones that hold a seat. The saga decides on this list, so
 // one that may be incomplete is not a yes: its reservations would get no episode and no refund and the saga would end COMPLETED. The page, the
 // number of pages and the total must all be said and must add up; a page that fails gives no partial list.
 func (r *Reservations) ListAffected(ctx context.Context, tenantID, departureID string) ([]string, error) {
@@ -38,6 +45,7 @@ func (r *Reservations) ListAffected(ctx context.Context, tenantID, departureID s
 		return nil, err
 	}
 	var ids []string
+	seen := 0 // every row read, kept or not: the pages add up to the total that was said, whatever the status
 	for page := 1; page <= maxPages; page++ {
 		query := url.Values{"page": {strconv.Itoa(page)}, "limit": {strconv.Itoa(pageSize)}}
 		status, reply, err := r.c.do(ctx, http.MethodGet, base+"?"+query.Encode(), "", nil)
@@ -48,7 +56,7 @@ func (r *Reservations) ListAffected(ctx context.Context, tenantID, departureID s
 			return nil, refusal(status)
 		}
 		var answer struct {
-			Data []struct{ ReservationID string }
+			Data []struct{ ReservationID, Status string }
 			Meta *struct{ Page, Total, TotalPages *int }
 		}
 		if json.Unmarshal(reply, &answer) != nil || answer.Data == nil || answer.Meta == nil || answer.Meta.Page == nil || answer.Meta.Total == nil ||
@@ -59,13 +67,19 @@ func (r *Reservations) ListAffected(ctx context.Context, tenantID, departureID s
 			if !saga.ValidID(row.ReservationID) {
 				return nil, errUnclear("a reservation has no valid id")
 			}
-			ids = append(ids, row.ReservationID)
+			if !knownStatus[row.Status] {
+				return nil, errUnclear("a reservation has no known status")
+			}
+			seen++
+			if holdsASeat[row.Status] {
+				ids = append(ids, row.ReservationID)
+			}
 		}
 		if page < *answer.Meta.TotalPages {
 			continue
 		}
 		// the last page: the rows must be the pages that were said, no fewer, whatever moved while they were read
-		if (*answer.Meta.TotalPages == 0) != (len(answer.Data) == 0 && page == 1) || len(ids) < *answer.Meta.Total {
+		if (*answer.Meta.TotalPages == 0) != (len(answer.Data) == 0 && page == 1) || seen < *answer.Meta.Total {
 			return nil, errUnclear("the pages do not add up to the total")
 		}
 		return ids, nil
