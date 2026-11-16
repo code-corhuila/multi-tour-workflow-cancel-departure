@@ -147,8 +147,8 @@ func TestC_the_proposals_are_voided_with_the_departure_and_the_instant(t *testin
 func TestC_the_list_of_reservations_is_read_page_by_page_until_the_last(t *testing.T) {
 	a, b, c := reservation, "66666666-6666-4666-8666-666666666662", "66666666-6666-4666-8666-666666666663"
 	srv := newServer(t,
-		reply{200, `{"data":[{"reservationId":"` + a + `"},{"reservationId":"` + b + `"}],"meta":{"page":1,"limit":100,"total":3,"totalPages":2}}`},
-		reply{200, `{"data":[{"reservationId":"` + c + `"}],"meta":{"page":2,"limit":100,"total":3,"totalPages":2}}`})
+		reply{200, `{"data":[{"reservationId":"` + a + `","status":"CONFIRMED"},{"reservationId":"` + b + `","status":"CONFIRMED"}],"meta":{"page":1,"limit":100,"total":3,"totalPages":2}}`},
+		reply{200, `{"data":[{"reservationId":"` + c + `","status":"CONFIRMED"}],"meta":{"page":2,"limit":100,"total":3,"totalPages":2}}`})
 	ids, err := participants.NewReservations(srv.URL, cfg).ListAffected(context.Background(), tenant, departure)
 	if err != nil || len(ids) != 3 || ids[0] != a || ids[1] != b || ids[2] != c {
 		t.Fatalf("ids %v, err %v", ids, err)
@@ -157,6 +157,29 @@ func TestC_the_list_of_reservations_is_read_page_by_page_until_the_last(t *testi
 	if srv.count() != 2 || srv.requests[0].URI != base+"?limit=100&page=1" || srv.requests[1].URI != base+"?limit=100&page=2" || srv.requests[0].Method != "GET" ||
 		srv.requests[0].Auth != "Bearer "+token {
 		t.Fatalf("requests %+v", srv.requests)
+	}
+}
+
+// The list of the contract carries every reservation of the departure, the cancelled and the finished ones too; the episode of a rescheduling is
+// opened only for the ones that hold a seat (PENDING_PAYMENT, CONFIRMED). The pages still add up to the total that was said.
+func TestC_only_the_reservations_that_hold_a_seat_are_returned_and_the_pages_still_add_up(t *testing.T) {
+	a, b, c, d := reservation, "66666666-6666-4666-8666-666666666662", "66666666-6666-4666-8666-666666666663", "66666666-6666-4666-8666-666666666664"
+	srv := newServer(t, reply{200, `{"data":[{"reservationId":"` + a + `","status":"PENDING_PAYMENT"},{"reservationId":"` + b + `","status":"CANCELLED"},` +
+		`{"reservationId":"` + c + `","status":"CONFIRMED"},{"reservationId":"` + d + `","status":"COMPLETED"}],"meta":{"page":1,"limit":100,"total":4,"totalPages":1}}`})
+	ids, err := participants.NewReservations(srv.URL, cfg).ListAffected(context.Background(), tenant, departure)
+	if err != nil || len(ids) != 2 || ids[0] != a || ids[1] != c {
+		t.Fatalf("ids %v, err %v: the cancelled and the completed ones hold no seat", ids, err)
+	}
+}
+
+// A row that does not say its status, or says one the contract does not have, is not a yes: the saga cannot tell if it holds a seat.
+func TestC_a_reservation_without_a_known_status_is_unclear(t *testing.T) {
+	for _, row := range []string{`{"reservationId":"` + reservation + `"}`, `{"reservationId":"` + reservation + `","status":"MOVED"}`} {
+		srv := newServer(t, reply{200, `{"data":[` + row + `],"meta":{"page":1,"limit":100,"total":1,"totalPages":1}}`})
+		_, err := participants.NewReservations(srv.URL, cfg).ListAffected(context.Background(), tenant, departure)
+		if err == nil || errors.Is(err, out.ErrRefused) || errors.Is(err, out.ErrNotFound) {
+			t.Fatalf("row %s: err %v, want an unclear answer", row, err)
+		}
 	}
 }
 
@@ -171,7 +194,7 @@ func TestC_a_departure_with_no_reservation_gives_an_empty_list(t *testing.T) {
 // A list that never ends must not make the saga loop for ever: it is not a yes, and the saga asks again later.
 func TestC_a_list_that_never_ends_or_has_a_bad_id_or_no_fields_is_unclear(t *testing.T) {
 	for name, rep := range map[string]reply{
-		"endless":   {200, `{"data":[{"reservationId":"` + reservation + `"}],"meta":{"page":1,"limit":100,"total":9999999,"totalPages":99999}}`},
+		"endless":   {200, `{"data":[{"reservationId":"` + reservation + `","status":"CONFIRMED"}],"meta":{"page":1,"limit":100,"total":9999999,"totalPages":99999}}`},
 		"bad id":    {200, `{"data":[{"reservationId":"not-an-id"}],"meta":{"page":1,"limit":100,"total":1,"totalPages":1}}`},
 		"no fields": {200, `{"hello":"world"}`},
 	} {
@@ -319,7 +342,7 @@ func TestC_a_cancelled_context_stops_the_attempts(t *testing.T) {
 // The saga keeps what the list says and decides on it: a list that may be incomplete is not a yes, because the reservations it lacks would get no
 // episode and no refund and the saga would end COMPLETED.
 func TestC_a_list_that_may_be_incomplete_is_unclear(t *testing.T) {
-	row := `{"reservationId":"` + reservation + `"}`
+	row := `{"reservationId":"` + reservation + `","status":"CONFIRMED"}`
 	for name, body := range map[string]string{
 		"no total pages":       `{"data":[` + row + `],"meta":{"page":1,"limit":100,"total":1}}`,
 		"zero pages with data": `{"data":[` + row + `],"meta":{"page":1,"limit":100,"total":1,"totalPages":0}}`,
@@ -337,7 +360,7 @@ func TestC_a_list_that_may_be_incomplete_is_unclear(t *testing.T) {
 }
 
 func TestC_a_page_that_fails_gives_no_partial_list(t *testing.T) {
-	srv := newServer(t, reply{200, `{"data":[{"reservationId":"` + reservation + `"}],"meta":{"page":1,"limit":100,"total":101,"totalPages":2}}`}, reply{503, `{}`})
+	srv := newServer(t, reply{200, `{"data":[{"reservationId":"` + reservation + `","status":"CONFIRMED"}],"meta":{"page":1,"limit":100,"total":101,"totalPages":2}}`}, reply{503, `{}`})
 	ids, err := participants.NewReservations(srv.URL, cfg).ListAffected(context.Background(), tenant, departure)
 	if err == nil || ids != nil {
 		t.Fatalf("ids %v, err %v: the second page failed, so there is no list", ids, err)
